@@ -1,6 +1,10 @@
 [package]
-name = "wed"
+name = "tedwm"
 version = "0.1.0"
 authors = ["bryal <96.bryal@gmail.com>"]
 
 [dependencies]
+clap = "2.20"
+termion = "1.2"
+unicode-width = "0.1"
+unicode-segmentation = "1.1"
