@@ -348,7 +348,7 @@ impl TedTui {
         let buf = current_buf_mut!(self);
         let rest = buf.lines[self.point.y].data.split_off(self.point.x_byte_i);
 
-        buf.lines.insert(self.point.y, Line { data: rest });
+        buf.lines.insert(self.point.y + 1, Line { data: rest });
 
         self.point.y += 1;
         self.point.x_byte_i = 0;
