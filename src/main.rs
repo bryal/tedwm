@@ -7,6 +7,7 @@ extern crate unicode_segmentation;
 use clap::{Arg, App};
 use std::collections::HashMap;
 use std::io::{self, Write, stdout, stdin, Stdout};
+use std::iter::once;
 use std::str;
 use termion::{color, cursor};
 use termion::event::{Event, Key};
@@ -180,9 +181,10 @@ impl TedTui {
         'a: loop {
             if let Some(line) = buf.lines.get(self.point.y) {
                 let offset = self.point.x_byte_i;
-                for (m, _) in line.data[self.point.x_byte_i..].grapheme_indices(true) {
-                    let i = m + offset;
-
+                let s_ahead = &line.data[self.point.x_byte_i..];
+                for i in s_ahead.grapheme_indices(true)
+                                .map(|(i, _)| i + offset)
+                                .chain(once(line.data.len())) {
                     if n == 0 {
                         self.point.x_byte_i = i;
                         self.point.update_x(buf);
@@ -193,8 +195,15 @@ impl TedTui {
                         n -= 1;
                     }
                 }
-                self.point.y += 1;
-                self.point.x_byte_i = 0;
+                if self.point.y + 1 == buf.lines.len() {
+                    self.point.update_x(buf);
+                    self.point.prev_x = self.point.x;
+
+                    return true;
+                } else {
+                    self.point.y += 1;
+                    self.point.x_byte_i = 0;
+                }
             } else {
                 self.point.update_x(buf);
                 self.point.prev_x = self.point.x;
@@ -208,16 +217,29 @@ impl TedTui {
     /// If beginning of buf reached before n = 0, return true
     fn move_point_backward(&mut self, mut n: usize) -> bool {
         let buf = current_buf!(self);
-        let mut line = &buf.lines[self.point.y];
 
+        let mut line = &buf.lines[self.point.y];
         'a: loop {
-            for (i, _) in line.data[0..self.point.x_byte_i].grapheme_indices(true).rev() {
-                if n == 0 {
+            let grapheme_indices_rev = if line.data.len() == self.point.x_byte_i {
+                Box::new(line.data[0..self.point.x_byte_i]
+                    .grapheme_indices(true)
+                    .map(|(i, _)| i)
+                    .chain(once(self.point.x_byte_i))
+                    .rev()) as Box<Iterator<Item = usize>>
+            } else {
+                Box::new(line.data[0..(self.point.x_byte_i + 1)]
+                    .grapheme_indices(true)
+                    .map(|(i, _)| i)
+                    .rev()) as Box<Iterator<Item = usize>>
+            };
+            for i in grapheme_indices_rev {
+                let beginning_reached = self.point.y == 0 && i == 0;
+                if n == 0 || beginning_reached {
                     self.point.x_byte_i = i;
                     self.point.update_x(buf);
                     self.point.prev_x = self.point.x;
 
-                    return false;
+                    return beginning_reached;
                 } else {
                     n -= 1;
                 }
