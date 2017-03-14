@@ -3,16 +3,29 @@ extern crate clap;
 extern crate termion;
 extern crate unicode_width;
 extern crate unicode_segmentation;
+extern crate futures;
+extern crate tokio_timer;
+
+#[cfg(feature = "profiling")]
+extern crate cpuprofiler;
 
 use clap::{Arg, App};
+
+#[cfg(feature = "profiling")]
+use cpuprofiler::PROFILER;
+
+use futures::{Sink, Stream};
+use futures::sync::mpsc::channel;
+use std::{str, thread};
 use std::collections::HashMap;
 use std::io::{self, Write, stdout, stdin, Stdout};
 use std::iter::once;
-use std::str;
+use std::time::Duration;
 use termion::{color, cursor};
-use termion::event::{Event, Key};
+use termion::event::{Event, Key, MouseEvent};
 use termion::input::TermRead;
 use termion::raw::{IntoRawMode, RawTerminal};
+use tokio_timer::Timer;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -118,6 +131,7 @@ struct TedTui {
     point: Point,
     view_pos: (usize, usize),
     current_buf_name: String,
+    term_size: (u16, u16),
 }
 
 impl TedTui {
@@ -130,8 +144,8 @@ impl TedTui {
         keymap.insert(Key::Ctrl('b'), Cmd::Backward(1));
         keymap.insert(Key::Ctrl('n'), Cmd::Downward(1));
         keymap.insert(Key::Ctrl('p'), Cmd::Upward(1));
-        keymap.insert(Key::Delete, Cmd::DeleteForward);
-        keymap.insert(Key::Backspace, Cmd::DeleteBackward);
+        keymap.insert(Key::Ctrl('d'), Cmd::DeleteForward);
+        keymap.insert(Key::Ctrl('h'), Cmd::DeleteBackward);
         keymap.insert(Key::Char('\n'), Cmd::Newline);
         keymap.insert(Key::Char('\t'), Cmd::Tab);
         keymap.insert(Key::Esc, Cmd::Exit);
@@ -148,6 +162,7 @@ impl TedTui {
             },
             view_pos: (0, 0),
             current_buf_name: "*scratch*".to_string(),
+            term_size: termion::terminal_size().unwrap(),
         }
     }
 
@@ -366,7 +381,6 @@ impl TedTui {
         }
     }
 
-
     /// Returns false if exit
     fn eval(&mut self, cmd: Cmd) -> bool {
         match cmd {
@@ -413,19 +427,30 @@ impl TedTui {
         self.message_buf().lines.push(Line { data: msg });
     }
 
-    fn render(&mut self) -> Result<(), io::Error> {
-        let (w, h) = termion::terminal_size().unwrap();
-        let tab_spaces = String::from_utf8(vec![' ' as u8; TAB_WIDTH]).unwrap();
+    fn render_if_resized(&mut self) -> Result<(), io::Error> {
+        let size = termion::terminal_size().unwrap();
+        if self.term_size != size {
+            self.term_size = size;
 
+            self._render()
+        } else {
+            Ok(())
+        }
+    }
+
+    fn _render(&mut self) -> Result<(), io::Error> {
+        let tab_spaces = String::from_utf8(vec![' ' as u8; TAB_WIDTH]).unwrap();
+        let (w, h) = self.term_size;
         let c_bg = color::Bg(color::Rgb(0x18, 0x18, 0x10));
         let c_text = color::Fg(color::Rgb(0xF0, 0xE6, 0xD6));
         let c_dim_text = color::Fg(color::Rgb(0x60, 0x56, 0x50));
 
         write!(self.stdout,
-               "{}{}{}{}",
+               "{}{}{}{}{}",
+               cursor::Goto(1, 1),
                c_bg,
                c_text,
-               termion::clear::All,
+               termion::clear::AfterCursor,
                cursor::Hide)?;
 
         for i in 0..h {
@@ -458,6 +483,13 @@ impl TedTui {
 
         self.stdout.flush()
     }
+
+    /// Render unconditionally
+    fn render(&mut self) -> Result<(), io::Error> {
+        self.term_size = termion::terminal_size().unwrap();
+
+        self._render()
+    }
 }
 
 /// Formatting of key events
@@ -487,30 +519,75 @@ fn ted_key_to_string(k: Key) -> String {
     }
 }
 
-fn ted_event_to_string(e: Event) -> String {
-    match e {
-        Event::Key(k) => format!("keyevent {}", ted_key_to_string(k)),
-        Event::Mouse(_) => format!("mouseevent"),
-        Event::Unsupported(_) => format!("unsupportedevent"),
+enum TuiEvent {
+    Update,
+    Key(Key),
+    Mouse(MouseEvent),
+    Unsupported(Vec<u8>),
+}
+
+impl From<Event> for TuiEvent {
+    fn from(e: Event) -> TuiEvent {
+        match e {
+            Event::Key(k) => TuiEvent::Key(k),
+            Event::Mouse(m) => TuiEvent::Mouse(m),
+            Event::Unsupported(u) => TuiEvent::Unsupported(u),
+
+        }
+    }
+}
+
+/// Iterator for event loop of terminal events
+struct TuiEvents {
+    event_it: Box<Iterator<Item = Option<Result<TuiEvent, io::Error>>>>,
+}
+
+impl TuiEvents {
+    fn new(update_rate_hz: u64) -> Self {
+        let (tx, term_read_event_rx) = channel(0);
+
+        thread::spawn(|| {
+            let mut tx = tx.wait();
+            while let Some(read_event_result) = stdin().events().next() {
+                tx.send(Some(read_event_result.map(TuiEvent::from)))
+                  .expect("Failed to send on channel");
+            }
+            tx.send(None);
+        });
+
+        let update_period = Duration::from_millis(1000 / update_rate_hz);
+
+        let timer = Timer::default();
+        let update_event_stream = timer.interval(update_period)
+                                       .map(|_| Some(Ok(TuiEvent::Update)))
+                                       .map_err(|_| ());
+
+        let event_it = term_read_event_rx.select(update_event_stream).wait().map(|r| r.unwrap());
+
+        TuiEvents { event_it: Box::new(event_it) as Box<Iterator<Item = _>> }
+    }
+}
+
+impl Iterator for TuiEvents {
+    type Item = TuiEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.event_it.next().unwrap().map(|result| result.expect("Failed to read terminal event"))
     }
 }
 
 /// Start editor in terminal user interface mode
 fn start_tui_mode() {
-    let (w, h) = termion::terminal_size().unwrap();
-
-    println!("size: {}x{}", w, h);
-
-    let stdin = stdin();
     let mut ted = TedTui::new();
 
     ted.render().expect("Rendering failed");
 
-    for c in stdin.events() {
-        let evt = c.unwrap();
+    #[cfg(feature = "profiling")]
+    PROFILER.lock().unwrap().start("./prof.profile").expect("Failed to start profiler");
 
-        match evt {
-            Event::Key(k) => {
+    for event in TuiEvents::new(5) {
+        match event {
+            TuiEvent::Key(k) => {
                 if let Some(cmd) = ted.keymap.get(&k).cloned() {
                     if !ted.eval(cmd) {
                         break;
@@ -522,12 +599,23 @@ fn start_tui_mode() {
                 } else {
                     ted.message(format!("Key {} is undefined", ted_key_to_string(k)))
                 }
+                ted.render().expect("Rendering failed");
             }
-            _ => ted.message(format!("Event {} is undefined", ted_event_to_string(evt))),
+            TuiEvent::Update => {
+                ted.render_if_resized().expect("Rendering failed");
+            }
+            TuiEvent::Mouse(_) => {
+                ted.message(format!("Mousevent is undefined"));
+                ted.render().expect("Rendering failed");
+            }
+            TuiEvent::Unsupported(u) => {
+                ted.message(format!("Unsupported event {:?}", u));
+            }
         }
-
-        ted.render().expect("Rendering failed");
     }
+
+    #[cfg(feature = "profiling")]
+    PROFILER.lock().unwrap().stop().expect("Failed to stop profiler");
 }
 
 fn main() {
