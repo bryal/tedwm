@@ -48,6 +48,12 @@ macro_rules! current_buf_mut {
     };
 }
 
+macro_rules! println_err {
+    ($fmt:expr, $( $args:expr ),*) => {
+        writeln!(io::stderr(), $fmt, $($args),*).unwrap()
+    };
+}
+
 /// Margin when scrolling
 const SCROLL_MARGIN: u16 = 10;
 /// Whether to insert spaces on TAB press
@@ -290,6 +296,7 @@ impl TedTui {
         };
 
         self.point.x = 0;
+        self.point.x_byte_i = 0;
         for (i, g) in buf.lines[self.point.y].data.grapheme_indices(true) {
             let w = g.width();
             if self.point.x + w > self.point.prev_x {
@@ -552,7 +559,7 @@ impl TuiEvents {
                 tx.send(Some(read_event_result.map(TuiEvent::from)))
                   .expect("Failed to send on channel");
             }
-            tx.send(None);
+            tx.send(None).expect("Failed to send on channel");
         });
 
         let update_period = Duration::from_millis(1000 / update_rate_hz);
