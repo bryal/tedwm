@@ -295,16 +295,18 @@ impl TedTui {
             false
         };
 
+        let line = &buf.lines[self.point.y].data;
         self.point.x = 0;
         self.point.x_byte_i = 0;
-        for (i, g) in buf.lines[self.point.y].data.grapheme_indices(true) {
+        for (i, g) in line.grapheme_indices(true) {
             let w = g.width();
             if self.point.x + w > self.point.prev_x {
                 self.point.x_byte_i = i;
-                break;
+                return end_of_buf;
             }
             self.point.x += w;
         }
+        self.point.x_byte_i = line.len();
         end_of_buf
     }
 
@@ -460,32 +462,52 @@ impl TedTui {
                termion::clear::AfterCursor,
                cursor::Hide)?;
 
-        for i in 0..h {
-            if let Some(line) = current_buf!(self).lines.get(i as usize) {
-                write!(self.stdout,
-                       "{}{}{:05}. {}",
-                       cursor::Goto(1, i + 1),
-                       c_dim_text,
-                       i + 1,
-                       c_text)?;
+        let linum_width = 7;
+        let mut line_lens = Vec::with_capacity(h as usize);
+        let mut draw_line_n = 1;
+        let mut i = 0;
+        while let Some(line) = current_buf!(self).lines.get(i) {
+            write!(self.stdout,
+                   "{}{}{:05}. {}",
+                   cursor::Goto(1, draw_line_n),
+                   c_dim_text,
+                   i + 1,
+                   c_text)?;
 
-                let mut line_len = 7;
+            /// Line in memory
+            let mut line_len = linum_width;
+            /// Line drawn in terminal
+            let mut draw_line_len = line_len;
+            for g in line.data.graphemes(true) {
+                let s = if g == "\t" { &tab_spaces } else { g };
+                let s_w = s.width();
 
-                for g in line.data.graphemes(true) {
-                    let s = if g == "\t" { &tab_spaces } else { g };
-                    let s_w = s.width();
-
-                    if line_len + s_w < w as usize {
-                        write!(self.stdout, "{}", s)?;
-                        line_len += s_w;
-                    }
+                if draw_line_len + s_w <= w as usize {
+                    write!(self.stdout, "{}", s)?;
+                    line_len += s_w;
+                    draw_line_len += s_w;
+                } else {
+                    draw_line_n += 1;
+                    line_len += s_w;
+                    write!(self.stdout, "{}{}", cursor::Goto(1, draw_line_n), s)?;
+                    draw_line_len = s_w;
                 }
             }
+            line_lens.push(line_len);
+            draw_line_n += 1;
+            i += 1;
         }
+
+        let cursor_x = ((self.point.x + linum_width) % w as usize + 1) as u16;
+        let prec_n_draw_lines = line_lens[0..self.point.y]
+            .iter()
+            .map(|&l| l / w as usize + 1)
+            .sum::<usize>();
+        let cursor_y = (prec_n_draw_lines + (self.point.x + linum_width) / w as usize + 1) as u16;
 
         write!(self.stdout,
                "{}{}",
-               cursor::Goto(self.point.x as u16 + 1 + 7, self.point.y as u16 + 1),
+               cursor::Goto(cursor_x, cursor_y),
                cursor::Show)?;
 
         self.stdout.flush()
