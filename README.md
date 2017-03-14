@@ -15,7 +15,7 @@ pain points, due to the fragmented and stand-alone nature of the tools in the ec
 Introducing TedWM.
 Aimed at developers who wish for a unified, integrated desktop environment experience
 without the bloat of a typical desktop environment, while still retaining absolute
-customizability, it combines a window manager with a text-editor and a terminal emulator.
+customizability. TedWM combines a window manager with a text-editor and a terminal emulator.
 All assets of the environment are configurable and fully programmable through a common scripting language.
 
 ## Milestones
@@ -28,3 +28,4 @@ All assets of the environment are configurable and fully programmable through a 
 - [ ] Terminal emulator
 - [ ] Application launcher
 - [ ] Tray
+- [ ] Probably a lot more?

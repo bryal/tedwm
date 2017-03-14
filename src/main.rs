@@ -17,6 +17,7 @@ use cpuprofiler::PROFILER;
 use futures::{Sink, Stream};
 use futures::sync::mpsc::channel;
 use std::{str, thread, fs};
+use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::io::{self, Write, stdout, stdin, Stdout, BufRead};
 use std::iter::once;
@@ -102,14 +103,36 @@ struct Line {
     ///
     /// Used to determine whether to redraw when rendering
     changed: bool,
+    /// Track width in graphemes of `data`
+    width: usize,
 }
 
 impl Line {
     fn new(s: String) -> Line {
+        let w = s.width();
         Line {
             data: s,
             changed: true,
+            width: w,
         }
+    }
+
+    fn insert_str(&mut self, i: usize, s: &str) {
+        self.data.insert_str(i, s);
+        self.changed = true;
+        self.width = self.data.width();
+    }
+
+    fn push_str(&mut self, s: &str) {
+        self.data.push_str(s);
+        self.changed = true;
+        self.width = self.data.width();
+    }
+
+    fn remove(&mut self, i: usize) {
+        self.data.remove(i);
+        self.changed = true;
+        self.width = self.data.width();
     }
 }
 
@@ -164,6 +187,7 @@ enum Cmd {
 }
 
 struct View {
+    /// 0-based position of top of view based on drawn lines
     y: usize,
     /// Track whether the view has moved/changed.
     ///
@@ -186,10 +210,9 @@ struct TedTui {
     keymap: HashMap<Key, Cmd>,
     stdout: RawTerminal<Stdout>,
     point: Point,
-    /// 1-based position of top of view based on drawn lines
     view: View,
     current_buf_name: String,
-    prev_term_size: (u16, u16),
+    term_size: (u16, u16),
 }
 
 impl TedTui {
@@ -217,11 +240,11 @@ impl TedTui {
             stdout: stdout().into_raw_mode().unwrap(),
             point: Point::new(),
             view: View {
-                y: 1,
+                y: 0,
                 changed: true,
             },
             current_buf_name: "*scratch*".to_string(),
-            prev_term_size: (0, 0),
+            term_size: (0, 0),
         }
     }
 
@@ -235,8 +258,7 @@ impl TedTui {
     fn insert_str_at_point(&mut self, s: &str) {
         {
             let line = &mut current_buf_mut!(self).lines[self.point.y];
-            line.data.insert_str(self.point.x_byte_i, s);
-            line.changed = true;
+            line.insert_str(self.point.x_byte_i, s);
         }
 
         self.point.x_byte_i += s.len();
@@ -378,12 +400,12 @@ impl TedTui {
         self.point.prev_x = self.point.x;
 
         if self.point.x_byte_i < buf.lines[self.point.y].data.len() {
-            buf.lines[self.point.y].data.remove(self.point.x_byte_i);
-            buf.lines[self.point.y].changed = true;
+            buf.lines[self.point.y].remove(self.point.x_byte_i);
+
             false
         } else if self.point.y < n_lines - 1 {
             let next_line = buf.lines.remove(self.point.y + 1);
-            buf.lines[self.point.y].data.push_str(&next_line.data);
+            buf.lines[self.point.y].push_str(&next_line.data);
 
             for changed_or_moved_line in &mut buf.lines[self.point.y..] {
                 changed_or_moved_line.changed = true;
@@ -404,8 +426,7 @@ impl TedTui {
                 let (i, _) =
                     line.data[0..self.point.x_byte_i].grapheme_indices(true).rev().next().unwrap();
 
-                line.data.remove(i);
-                line.changed = true;
+                line.remove(i);
                 i
             };
             self.point.x_byte_i = i;
@@ -421,7 +442,7 @@ impl TedTui {
             self.point.update_x(buf);
             self.point.prev_x = self.point.x;
 
-            buf.lines[self.point.y].data.push_str(&line.data);
+            buf.lines[self.point.y].push_str(&line.data);
 
             for changed_or_moved_line in &mut buf.lines[self.point.y..] {
                 changed_or_moved_line.changed = true;
@@ -437,6 +458,7 @@ impl TedTui {
     fn newline(&mut self) {
         let buf = current_buf_mut!(self);
         let rest = buf.lines[self.point.y].data.split_off(self.point.x_byte_i);
+        buf.lines[self.point.y].width = buf.lines[self.point.y].data.width();
 
         buf.lines.insert(self.point.y + 1, Line::new(rest));
 
@@ -552,7 +574,36 @@ impl TedTui {
     /// Position the view such that the cursor is visible.
     ///
     /// How exactly the view is positioned depends on the config value `SCROLL_MARGIN`
-    fn reposition_view(&mut self) {}
+    fn reposition_view(&mut self) {
+        let h = self.term_size.1;
+        let point_draw_y = self.point_draw_pos().1;
+        let top_margin = self.view.y as i32 + SCROLL_MARGIN as i32;
+        let bot_margin = self.view.y as i32 + h as i32 - SCROLL_MARGIN as i32;
+        let move_relative_up = min(point_draw_y as i32 - top_margin, 0);
+        let move_relative_down = max(point_draw_y as i32 - bot_margin, 0);
+
+        let bot = current_buf!(self).lines.len();
+
+        let view_y = min(bot,
+                         max(0,
+                             self.view.y as i32 + move_relative_up +
+                             move_relative_down) as usize);
+        if view_y != self.view.y {
+            self.view.changed = true
+        }
+        println_err!("h: {}, point_draw_y: {}, top_m: {}, bot_m: {}, up: {}, down: {}, bot: {}, \
+                      view_y: {}, view.y: {}",
+                     h,
+                     point_draw_y,
+                     top_margin,
+                     bot_margin,
+                     move_relative_up,
+                     move_relative_down,
+                     bot,
+                     view_y,
+                     self.view.y);
+        self.view.y = view_y;
+    }
 
     /// Get the message buf
     fn message_buf(&mut self) -> &mut Buf {
@@ -566,14 +617,24 @@ impl TedTui {
         self.message_buf().lines.push(Line::new(msg));
     }
 
+    /// Returns whether terminal size has changed
+    fn update_term_size(&mut self) -> bool {
+        let size = termion::terminal_size().unwrap();
+        let changed = self.term_size != size;
+        self.term_size = size;
+
+        self.reposition_view();
+
+        changed
+    }
+
     fn _redraw(&mut self, redraw: Redraw) -> Result<(), io::Error> {
         let tab_spaces = String::from_utf8(vec![' ' as u8; TAB_WIDTH]).unwrap();
         let c_bg = color::Bg(color::Rgb(0x18, 0x18, 0x10));
         let c_text = color::Fg(color::Rgb(0xF0, 0xE6, 0xD6));
         let c_dim_text = color::Fg(color::Rgb(0x60, 0x56, 0x50));
-
-        let (w, h) = termion::terminal_size().unwrap();
-        let term_size_changed = self.prev_term_size != (w, h);
+        let term_size_changed = self.update_term_size();
+        let (w, h) = self.term_size;
         let redraw_all = redraw == Redraw::All ||
                          (redraw == Redraw::Changed && (self.view.changed || term_size_changed));
 
@@ -584,81 +645,95 @@ impl TedTui {
                c_text,
                cursor::Hide)?;
 
-        if redraw_all {
-            write!(self.stdout, "{}", termion::clear::AfterCursor)?;
-        }
-
         let linum_width = 7;
-        let mut line_widths = Vec::with_capacity(h as usize);
-        let mut draw_line_n = 1u16;
+        /// Index of which row in terminal to draw on
+        let mut term_line_n = 1u16;
         let mut i = 0;
-        while let Some(line) = current_buf_mut!(self).lines.get_mut(i) {
-            let line_in_view = draw_line_n >= self.view.y as u16 &&
-                               draw_line_n <= self.view.y as u16 + h;
-            let should_redraw_line = line_in_view &&
-                                     (redraw_all || (redraw == Redraw::Changed && line.changed));
-            let line_width = if should_redraw_line {
-                write!(self.stdout, "{}", cursor::Goto(1, draw_line_n))?;
-                if !redraw_all {
+        while current_buf!(self).lines.get(i).is_some() {
+            let line_draw_y = self.n_draw_lines_before(i);
+            let line = &mut current_buf_mut!(self).lines[i];
+            let line_in_view = line_draw_y >= self.view.y &&
+                               line_draw_y <= self.view.y + h as usize;
+            let line_after_view = line_draw_y > self.view.y + h as usize;
+
+            if line_after_view {
+                break;
+            } else if line_in_view {
+                let should_redraw_line = redraw_all || (redraw == Redraw::Changed && line.changed);
+
+                println_err!("line {} in view", i);
+                if should_redraw_line {
+                    println_err!("Redrawing line {}", i);
+                    write!(self.stdout, "{}", cursor::Goto(1, term_line_n))?;
                     write!(self.stdout, "{}", termion::clear::CurrentLine)?;
-                }
-                write!(self.stdout, "{}{:>5}. {}", c_dim_text, i + 1, c_text)?;
+                    write!(self.stdout, "{}{:>5}. {}", c_dim_text, i + 1, c_text)?;
 
-                // Total width of the current line being drawn
-                let mut line_width = linum_width;
-                // Width of the line displayed in the terminal
-                let mut draw_line_width = line_width;
-                for g in line.data.graphemes(true) {
-                    let s = if g == "\t" { &tab_spaces } else { g };
-                    let s_w = s.width();
+                    // Width of the line displayed in the terminal
+                    let mut draw_line_width = linum_width;
+                    for g in line.data.graphemes(true) {
+                        let s = if g == "\t" { &tab_spaces } else { g };
+                        let s_w = s.width();
 
-                    if draw_line_width + s_w <= w as usize {
-                        write!(self.stdout, "{}", s)?;
-                        line_width += s_w;
-                        draw_line_width += s_w;
-                    } else {
-                        draw_line_n += 1;
-                        line_width += s_w;
-                        write!(self.stdout, "{}{}", cursor::Goto(1, draw_line_n), s)?;
-                        draw_line_width = s_w;
+                        if draw_line_width + s_w <= w as usize {
+                            write!(self.stdout, "{}", s)?;
+                            draw_line_width += s_w;
+                        } else {
+                            term_line_n += 1;
+                            write!(self.stdout, "{}{}", cursor::Goto(1, term_line_n), s)?;
+                            draw_line_width = s_w;
+                        }
                     }
+                    line.changed = false;
+                } else {
+                    term_line_n += ((linum_width + line.width) / w as usize) as u16;
                 }
-                line.changed = false;
-                line_width
-            } else {
-                draw_line_n += ((linum_width + line.data.width()) / w as usize) as u16;
-                line.data.width()
-            };
-
-            line_widths.push(line_width);
-
-            draw_line_n += 1;
+                term_line_n += 1;
+            }
             i += 1;
         }
         write!(self.stdout,
                "{}{}",
-               cursor::Goto(1, draw_line_n),
+               cursor::Goto(1, term_line_n),
                termion::clear::AfterCursor)?;
 
-        let cursor_x = ((self.point.x + linum_width) % w as usize + 1) as u16;
-        let prec_n_draw_lines = line_widths[0..self.point.y]
-            .iter()
-            .map(|&l| l / w as usize + 1)
-            .sum::<usize>();
-        let cursor_y = (prec_n_draw_lines + (self.point.x + linum_width) / w as usize + 1) as u16;
+        let (point_draw_x, point_draw_y) = self.point_draw_pos();
+        let (cursor_x, cursor_y) = (point_draw_x + 1, (point_draw_y - self.view.y) as u16 + 1);
 
         write!(self.stdout,
                "{}{}",
                cursor::Goto(cursor_x, cursor_y),
                cursor::Show)?;
 
-        self.prev_term_size = (w, h);
+        self.term_size = (w, h);
         self.view.changed = false;
         self.stdout.flush()
     }
 
     fn redraw(&mut self, redraw: Redraw) {
         self._redraw(redraw).expect("Redraw failed")
+    }
+
+    fn n_draw_lines_before(&self, line_y: usize) -> usize {
+        let w = self.term_size.0;
+        current_buf!(self).lines[0..line_y]
+            .iter()
+            .map(|l| l.width / w as usize + 1)
+            .sum::<usize>()
+    }
+
+    /// Position of point when taking line wrap into account
+    ///
+    /// E.g., consider a single line that spans 100 lines in terminal when drawn, due to line wrap.
+    /// In line-coordinates, y is still 0, because it's the first line.
+    /// In drawn-line-coordinates, y might be anywhere from 1 to 100,
+    /// depending on where the cursor is.
+    fn point_draw_pos(&self) -> (u16, usize) {
+        let w = self.term_size.0;
+        let linum_width = 7;
+        let x = ((self.point.x + linum_width) % w as usize) as u16;
+        let preceding_n_draw_lines = self.n_draw_lines_before(self.point.y);
+        let y = preceding_n_draw_lines + (self.point.x + linum_width) / w as usize;
+        (x, y)
     }
 }
 
