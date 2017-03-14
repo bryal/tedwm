@@ -16,10 +16,11 @@ use cpuprofiler::PROFILER;
 
 use futures::{Sink, Stream};
 use futures::sync::mpsc::channel;
-use std::{str, thread};
+use std::{str, thread, fs};
 use std::collections::HashMap;
-use std::io::{self, Write, stdout, stdin, Stdout};
+use std::io::{self, Write, stdout, stdin, Stdout, BufRead};
 use std::iter::once;
+use std::path::PathBuf;
 use std::time::Duration;
 use termion::{color, cursor};
 use termion::event::{Event, Key, MouseEvent};
@@ -31,25 +32,25 @@ use unicode_width::UnicodeWidthStr;
 
 /// Helper-macro for getting the current buffer without angering the borrow checker
 macro_rules! current_buf {
-    ($self:expr) => {
-        $self.bufs
-            .get(&$self.current_buf_name)
+    ($ted:expr) => {
+        $ted.bufs
+            .get(&$ted.current_buf_name)
             .expect(&format!("\"current buf\" {} does not exist is map",
-                             &$self.current_buf_name))
+                             &$ted.current_buf_name))
     };
 }
 /// Helper-macro for getting the current buffer without angering the borrow checker
 macro_rules! current_buf_mut {
-    ($self:expr) => {
-        $self.bufs
-            .get_mut(&$self.current_buf_name)
+    ($ted:expr) => {
+        $ted.bufs
+            .get_mut(&$ted.current_buf_name)
             .expect(&format!("\"current buf\" {} does not exist is map",
-                             &$self.current_buf_name))
+                             &$ted.current_buf_name))
     };
 }
 
 macro_rules! println_err {
-    ($fmt:expr, $( $args:expr ),*) => {
+    ($fmt:expr $(, $args:expr )*) => {
         writeln!(io::stderr(), $fmt, $($args),*).unwrap()
     };
 }
@@ -77,6 +78,15 @@ struct Point {
 }
 
 impl Point {
+    fn new() -> Point {
+        Point {
+            x: 0,
+            prev_x: 0,
+            y: 0,
+            x_byte_i: 0,
+        }
+    }
+
     /// Update the grapheme x-coordinate of the position in buffer `buf`
     fn update_x(&mut self, buf: &Buf) {
         self.x = buf.lines[self.y].data[0..self.x_byte_i]
@@ -88,6 +98,19 @@ impl Point {
 
 struct Line {
     data: String,
+    /// Track whether this line has been modified in buffer.
+    ///
+    /// Used to determine whether to redraw when rendering
+    changed: bool,
+}
+
+impl Line {
+    fn new(s: String) -> Line {
+        Line {
+            data: s,
+            changed: true,
+        }
+    }
 }
 
 /// A buf is a equivalent to a temporary file in memory.
@@ -95,11 +118,19 @@ struct Line {
 /// or simply a normal file loaded to memory for editing
 struct Buf {
     lines: Vec<Line>,
+    filepath: Option<PathBuf>,
 }
 
 impl Buf {
-    fn new() -> Self {
-        Buf { lines: vec![Line { data: String::new() }] }
+    fn new_buf() -> Self {
+        Buf {
+            lines: vec![Line::new(String::new())],
+            filepath: None,
+        }
+    }
+
+    fn new_file_buf(filepath: PathBuf) -> Self {
+        Buf { filepath: Some(filepath), ..Buf::new_buf() }
     }
 }
 
@@ -128,6 +159,26 @@ enum Cmd {
     Exit,
     /// Go to line n, counting from line 1 at the beginning of the buf
     GoToLine(u64),
+    /// Save file
+    Save,
+}
+
+struct View {
+    y: usize,
+    /// Track whether the view has moved/changed.
+    ///
+    /// Used to determine whether to redraw everything when rendering
+    changed: bool,
+}
+
+/// What to draw when redrawing
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Redraw {
+    /// Redraw everything in view unconditionally
+    All,
+    /// Redraw the cursor and lines that have been modified if view is unchanged,
+    /// or all lines if view has changed
+    Changed,
 }
 
 struct TedTui {
@@ -135,15 +186,16 @@ struct TedTui {
     keymap: HashMap<Key, Cmd>,
     stdout: RawTerminal<Stdout>,
     point: Point,
-    view_pos: (usize, usize),
+    /// 1-based position of top of view based on drawn lines
+    view: View,
     current_buf_name: String,
-    term_size: (u16, u16),
+    prev_term_size: (u16, u16),
 }
 
 impl TedTui {
     fn new() -> Self {
         let mut bufs = HashMap::new();
-        bufs.insert("*scratch*".to_string(), Buf::new());
+        bufs.insert("*scratch*".to_string(), Buf::new_buf());
 
         let mut keymap = HashMap::new();
         keymap.insert(Key::Ctrl('f'), Cmd::Forward(1));
@@ -151,24 +203,25 @@ impl TedTui {
         keymap.insert(Key::Ctrl('n'), Cmd::Downward(1));
         keymap.insert(Key::Ctrl('p'), Cmd::Upward(1));
         keymap.insert(Key::Ctrl('d'), Cmd::DeleteForward);
+        keymap.insert(Key::Delete, Cmd::DeleteForward);
         keymap.insert(Key::Ctrl('h'), Cmd::DeleteBackward);
+        keymap.insert(Key::Backspace, Cmd::DeleteBackward);
         keymap.insert(Key::Char('\n'), Cmd::Newline);
         keymap.insert(Key::Char('\t'), Cmd::Tab);
+        keymap.insert(Key::Ctrl('s'), Cmd::Save);
         keymap.insert(Key::Esc, Cmd::Exit);
 
         TedTui {
             bufs: bufs,
             keymap: keymap,
             stdout: stdout().into_raw_mode().unwrap(),
-            point: Point {
-                x: 0,
-                prev_x: 0,
-                y: 0,
-                x_byte_i: 0,
+            point: Point::new(),
+            view: View {
+                y: 1,
+                changed: true,
             },
-            view_pos: (0, 0),
             current_buf_name: "*scratch*".to_string(),
-            term_size: termion::terminal_size().unwrap(),
+            prev_term_size: (0, 0),
         }
     }
 
@@ -180,7 +233,11 @@ impl TedTui {
 
     /// Insert a string at point
     fn insert_str_at_point(&mut self, s: &str) {
-        current_buf_mut!(self).lines[self.point.y].data.insert_str(self.point.x_byte_i, s);
+        {
+            let line = &mut current_buf_mut!(self).lines[self.point.y];
+            line.data.insert_str(self.point.x_byte_i, s);
+            line.changed = true;
+        }
 
         self.point.x_byte_i += s.len();
         self.update_point_x();
@@ -202,10 +259,11 @@ impl TedTui {
         'a: loop {
             if let Some(line) = buf.lines.get(self.point.y) {
                 let offset = self.point.x_byte_i;
-                let s_ahead = &line.data[self.point.x_byte_i..];
-                for i in s_ahead.grapheme_indices(true)
-                                .map(|(i, _)| i + offset)
-                                .chain(once(line.data.len())) {
+                let is = line.data[self.point.x_byte_i..]
+                    .grapheme_indices(true)
+                    .map(|(i, _)| i + offset)
+                    .chain(once(line.data.len()));
+                for i in is {
                     if n == 0 {
                         self.point.x_byte_i = i;
                         self.point.update_x(buf);
@@ -280,19 +338,21 @@ impl TedTui {
     }
 
     /// Move point upward (negative) or downward (positive)
+    ///
+    /// Return whether end/beginning of buffer reached
     fn move_point_v(&mut self, n: isize) -> bool {
         let buf = current_buf!(self);
         let n_lines = buf.lines.len();
 
         let end_of_buf = if self.point.y as isize + n >= n_lines as isize {
             self.point.y = n_lines - 1;
-            true
+            false
         } else if (self.point.y as isize) + n < 0 {
             self.point.y = 0;
-            true
+            false
         } else {
             self.point.y = (self.point.y as isize + n) as usize;
-            false
+            true
         };
 
         let line = &buf.lines[self.point.y].data;
@@ -310,6 +370,7 @@ impl TedTui {
         end_of_buf
     }
 
+    /// Return true if at end of buffer
     fn delete_forward_at_point(&mut self) -> bool {
         let buf = current_buf_mut!(self);
         let n_lines = buf.lines.len();
@@ -318,53 +379,58 @@ impl TedTui {
 
         if self.point.x_byte_i < buf.lines[self.point.y].data.len() {
             buf.lines[self.point.y].data.remove(self.point.x_byte_i);
-            true
-        } else if self.point.y < n_lines {
+            buf.lines[self.point.y].changed = true;
+            false
+        } else if self.point.y < n_lines - 1 {
             let next_line = buf.lines.remove(self.point.y + 1);
             buf.lines[self.point.y].data.push_str(&next_line.data);
-            true
-        } else {
+
+            for changed_or_moved_line in &mut buf.lines[self.point.y..] {
+                changed_or_moved_line.changed = true;
+            }
             false
+        } else {
+            true
         }
     }
 
+    /// Return true if at beginning of buffer
     fn delete_backward_at_point(&mut self) -> bool {
         let buf = current_buf_mut!(self);
 
         if self.point.x > 0 {
             let i = {
                 let line = &mut buf.lines[self.point.y];
-
                 let (i, _) =
                     line.data[0..self.point.x_byte_i].grapheme_indices(true).rev().next().unwrap();
 
                 line.data.remove(i);
+                line.changed = true;
                 i
             };
             self.point.x_byte_i = i;
             self.point.update_x(buf);
             self.point.prev_x = self.point.x;
 
-            true
+            false
         } else if self.point.y > 0 {
             let line = buf.lines.remove(self.point.y);
 
-            {
-                let prev = &buf.lines[self.point.y - 1].data;
-                self.point.x_byte_i = prev.len();
-            }
+            self.point.x_byte_i = buf.lines[self.point.y - 1].data.len();
             self.point.y -= 1;
             self.point.update_x(buf);
             self.point.prev_x = self.point.x;
 
-            let prev = &mut buf.lines[self.point.y].data;
-            prev.push_str(&line.data);
+            buf.lines[self.point.y].data.push_str(&line.data);
 
-            true
+            for changed_or_moved_line in &mut buf.lines[self.point.y..] {
+                changed_or_moved_line.changed = true;
+            }
+            false
         } else {
             self.point.prev_x = self.point.x;
 
-            false
+            true
         }
     }
 
@@ -372,7 +438,11 @@ impl TedTui {
         let buf = current_buf_mut!(self);
         let rest = buf.lines[self.point.y].data.split_off(self.point.x_byte_i);
 
-        buf.lines.insert(self.point.y + 1, Line { data: rest });
+        buf.lines.insert(self.point.y + 1, Line::new(rest));
+
+        for changed_or_moved_line in &mut buf.lines[self.point.y..] {
+            changed_or_moved_line.changed = true;
+        }
 
         self.point.y += 1;
         self.point.x_byte_i = 0;
@@ -390,116 +460,188 @@ impl TedTui {
         }
     }
 
-    /// Returns false if exit
+    fn open_file(&mut self, name: &str) {
+        let filepath = fs::canonicalize(name).expect("File does not exist");
+        let reader = io::BufReader::new(fs::File::open(&filepath)
+            .expect("File could not be opened"));
+        let file_lines = reader.lines()
+                               .map(|result| result.map(|s| Line::new(s)))
+                               .collect::<Result<Vec<_>, _>>()
+                               .expect("File contains invalid utf8 data and cannot be displayed");
+
+        let mut buf = Buf::new_file_buf(filepath);
+        buf.lines =
+            if !file_lines.is_empty() { file_lines } else { vec![Line::new(String::new())] };
+
+        self.bufs.insert(name.to_string(), buf);
+        self.current_buf_name = name.to_string();
+        self.point = Point::new();
+    }
+
+    fn save_file(&mut self) {
+        fn write_lines_to_file(f: fs::File, lines: &[Line]) -> io::Result<()> {
+            let mut bw = io::BufWriter::new(f);
+
+            let (fst, rest) = lines.split_first().unwrap();
+
+            bw.write_all(fst.data.as_bytes())?;
+            for l in rest {
+                bw.write_all("\n".as_bytes()).and_then(|_| bw.write_all(l.data.as_bytes()))?;
+            }
+            Ok(())
+        }
+
+        let buf = current_buf!(self);
+
+        match buf.filepath {
+            Some(ref p) => fs::File::create(p)
+                .and_then(|f| write_lines_to_file(f, &buf.lines))
+                .expect("Failed to write buffer to file"),
+            None => unimplemented!(),
+        }
+    }
+
+    /// Returns true if exit
     fn eval(&mut self, cmd: Cmd) -> bool {
+        enum MoveRes {
+            Beg,
+            End,
+            Ok,
+        }
+
+        let mut r = MoveRes::Ok;
         match cmd {
             Cmd::Insert(c) => {
                 self.insert_char_at_point(c);
             }
-            Cmd::Forward(n) => {
-                self.move_point_forward(n);
-            }
-            Cmd::Backward(n) => {
-                self.move_point_backward(n);
-            }
-            Cmd::Downward(n) => {
-                self.move_point_v(n as isize);
-            }
-            Cmd::Upward(n) => {
-                self.move_point_v(-(n as isize));
-            }
-            Cmd::DeleteForward => {
-                self.delete_forward_at_point();
-            }
-            Cmd::DeleteBackward => {
-                self.delete_backward_at_point();
-            }
+            Cmd::Forward(n) => if self.move_point_forward(n) {
+                r = MoveRes::End
+            },
+            Cmd::Backward(n) => if self.move_point_backward(n) {
+                r = MoveRes::Beg
+            },
+            Cmd::Downward(n) => if self.move_point_v(n as isize) {
+                r = MoveRes::End
+            },
+            Cmd::Upward(n) => if self.move_point_v(-(n as isize)) {
+                r = MoveRes::Beg
+            },
+            Cmd::DeleteForward => if self.delete_forward_at_point() {
+                r = MoveRes::End
+            },
+            Cmd::DeleteBackward => if self.delete_backward_at_point() {
+                r = MoveRes::Beg
+            },
             Cmd::Newline => self.newline(),
             Cmd::Tab => self.tab(),
             Cmd::Exit => {
-                return false;
+                return true;
             }
             Cmd::GoToLine(_) => unimplemented!(),
+            Cmd::Save => self.save_file(),
         }
-        true
+        match r {
+            MoveRes::Beg => self.message("Beginning of buffer"),
+            MoveRes::End => self.message("End of buffer"),
+            MoveRes::Ok => (),
+        }
+        self.reposition_view();
+        false
     }
+
+    /// Position the view such that the cursor is visible.
+    ///
+    /// How exactly the view is positioned depends on the config value `SCROLL_MARGIN`
+    fn reposition_view(&mut self) {}
 
     /// Get the message buf
     fn message_buf(&mut self) -> &mut Buf {
-        self.bufs.entry("*messages*".to_string()).or_insert(Buf::new())
+        self.bufs.entry("*messages*".to_string()).or_insert(Buf::new_buf())
     }
 
     /// Write a message to the *message* buf
     fn message<S: Into<String>>(&mut self, msg: S) {
         let msg = msg.into();
 
-        self.message_buf().lines.push(Line { data: msg });
+        self.message_buf().lines.push(Line::new(msg));
     }
 
-    fn render_if_resized(&mut self) -> Result<(), io::Error> {
-        let size = termion::terminal_size().unwrap();
-        if self.term_size != size {
-            self.term_size = size;
-
-            self._render()
-        } else {
-            Ok(())
-        }
-    }
-
-    fn _render(&mut self) -> Result<(), io::Error> {
+    fn _redraw(&mut self, redraw: Redraw) -> Result<(), io::Error> {
         let tab_spaces = String::from_utf8(vec![' ' as u8; TAB_WIDTH]).unwrap();
-        let (w, h) = self.term_size;
         let c_bg = color::Bg(color::Rgb(0x18, 0x18, 0x10));
         let c_text = color::Fg(color::Rgb(0xF0, 0xE6, 0xD6));
         let c_dim_text = color::Fg(color::Rgb(0x60, 0x56, 0x50));
 
+        let (w, h) = termion::terminal_size().unwrap();
+        let term_size_changed = self.prev_term_size != (w, h);
+        let redraw_all = redraw == Redraw::All ||
+                         (redraw == Redraw::Changed && (self.view.changed || term_size_changed));
+
         write!(self.stdout,
-               "{}{}{}{}{}",
+               "{}{}{}{}",
                cursor::Goto(1, 1),
                c_bg,
                c_text,
-               termion::clear::AfterCursor,
                cursor::Hide)?;
 
+        if redraw_all {
+            write!(self.stdout, "{}", termion::clear::AfterCursor)?;
+        }
+
         let linum_width = 7;
-        let mut line_lens = Vec::with_capacity(h as usize);
-        let mut draw_line_n = 1;
+        let mut line_widths = Vec::with_capacity(h as usize);
+        let mut draw_line_n = 1u16;
         let mut i = 0;
-        while let Some(line) = current_buf!(self).lines.get(i) {
-            write!(self.stdout,
-                   "{}{}{:05}. {}",
-                   cursor::Goto(1, draw_line_n),
-                   c_dim_text,
-                   i + 1,
-                   c_text)?;
-
-            /// Line in memory
-            let mut line_len = linum_width;
-            /// Line drawn in terminal
-            let mut draw_line_len = line_len;
-            for g in line.data.graphemes(true) {
-                let s = if g == "\t" { &tab_spaces } else { g };
-                let s_w = s.width();
-
-                if draw_line_len + s_w <= w as usize {
-                    write!(self.stdout, "{}", s)?;
-                    line_len += s_w;
-                    draw_line_len += s_w;
-                } else {
-                    draw_line_n += 1;
-                    line_len += s_w;
-                    write!(self.stdout, "{}{}", cursor::Goto(1, draw_line_n), s)?;
-                    draw_line_len = s_w;
+        while let Some(line) = current_buf_mut!(self).lines.get_mut(i) {
+            let line_in_view = draw_line_n >= self.view.y as u16 &&
+                               draw_line_n <= self.view.y as u16 + h;
+            let should_redraw_line = line_in_view &&
+                                     (redraw_all || (redraw == Redraw::Changed && line.changed));
+            let line_width = if should_redraw_line {
+                write!(self.stdout, "{}", cursor::Goto(1, draw_line_n))?;
+                if !redraw_all {
+                    write!(self.stdout, "{}", termion::clear::CurrentLine)?;
                 }
-            }
-            line_lens.push(line_len);
+                write!(self.stdout, "{}{:>5}. {}", c_dim_text, i + 1, c_text)?;
+
+                // Total width of the current line being drawn
+                let mut line_width = linum_width;
+                // Width of the line displayed in the terminal
+                let mut draw_line_width = line_width;
+                for g in line.data.graphemes(true) {
+                    let s = if g == "\t" { &tab_spaces } else { g };
+                    let s_w = s.width();
+
+                    if draw_line_width + s_w <= w as usize {
+                        write!(self.stdout, "{}", s)?;
+                        line_width += s_w;
+                        draw_line_width += s_w;
+                    } else {
+                        draw_line_n += 1;
+                        line_width += s_w;
+                        write!(self.stdout, "{}{}", cursor::Goto(1, draw_line_n), s)?;
+                        draw_line_width = s_w;
+                    }
+                }
+                line.changed = false;
+                line_width
+            } else {
+                draw_line_n += ((linum_width + line.data.width()) / w as usize) as u16;
+                line.data.width()
+            };
+
+            line_widths.push(line_width);
+
             draw_line_n += 1;
             i += 1;
         }
+        write!(self.stdout,
+               "{}{}",
+               cursor::Goto(1, draw_line_n),
+               termion::clear::AfterCursor)?;
 
         let cursor_x = ((self.point.x + linum_width) % w as usize + 1) as u16;
-        let prec_n_draw_lines = line_lens[0..self.point.y]
+        let prec_n_draw_lines = line_widths[0..self.point.y]
             .iter()
             .map(|&l| l / w as usize + 1)
             .sum::<usize>();
@@ -510,14 +652,13 @@ impl TedTui {
                cursor::Goto(cursor_x, cursor_y),
                cursor::Show)?;
 
+        self.prev_term_size = (w, h);
+        self.view.changed = false;
         self.stdout.flush()
     }
 
-    /// Render unconditionally
-    fn render(&mut self) -> Result<(), io::Error> {
-        self.term_size = termion::terminal_size().unwrap();
-
-        self._render()
+    fn redraw(&mut self, redraw: Redraw) {
+        self._redraw(redraw).expect("Redraw failed")
     }
 }
 
@@ -606,10 +747,14 @@ impl Iterator for TuiEvents {
 }
 
 /// Start editor in terminal user interface mode
-fn start_tui_mode() {
+fn start_tui_mode(opt_filename: Option<&str>) {
     let mut ted = TedTui::new();
 
-    ted.render().expect("Rendering failed");
+    if let Some(filename) = opt_filename {
+        ted.open_file(filename);
+    }
+
+    ted.redraw(Redraw::All);
 
     #[cfg(feature = "profiling")]
     PROFILER.lock().unwrap().start("./prof.profile").expect("Failed to start profiler");
@@ -617,25 +762,28 @@ fn start_tui_mode() {
     for event in TuiEvents::new(5) {
         match event {
             TuiEvent::Key(k) => {
-                if let Some(cmd) = ted.keymap.get(&k).cloned() {
-                    if !ted.eval(cmd) {
-                        break;
-                    }
+                let exit = if let Some(cmd) = ted.keymap.get(&k).cloned() {
+                    ted.eval(cmd)
                 } else if let Key::Char(c) = k {
-                    if !ted.eval(Cmd::Insert(c)) {
-                        break;
-                    }
+                    ted.eval(Cmd::Insert(c))
                 } else {
-                    ted.message(format!("Key {} is undefined", ted_key_to_string(k)))
+                    ted.message(format!("Key {} is undefined", ted_key_to_string(k)));
+                    false
+                };
+
+                if exit {
+                    println_err!("Exiting...");
+                    break;
                 }
-                ted.render().expect("Rendering failed");
+
+                ted.redraw(Redraw::Changed);
             }
             TuiEvent::Update => {
-                ted.render_if_resized().expect("Rendering failed");
+                ted.redraw(Redraw::Changed);
             }
             TuiEvent::Mouse(_) => {
                 ted.message(format!("Mousevent is undefined"));
-                ted.render().expect("Rendering failed");
+                ted.redraw(Redraw::Changed);
             }
             TuiEvent::Unsupported(u) => {
                 ted.message(format!("Unsupported event {:?}", u));
@@ -656,11 +804,12 @@ fn main() {
             .short("t")
             .long("tui-mode")
             .help("Don't open in new GUI window, instead run in Terminal User Interface mode"))
+        .arg(Arg::with_name("file").help("File to edit"))
         .get_matches();
 
     if matches.is_present("tui-mode") {
         // Start in terminal mode
-        start_tui_mode();
+        start_tui_mode(matches.value_of("file"));
     } else {
         // Start GUI mode. Vulkan?
         unimplemented!();
