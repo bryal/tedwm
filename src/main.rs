@@ -29,7 +29,6 @@ use termion::input::TermRead;
 use termion::raw::{IntoRawMode, RawTerminal};
 use tokio_timer::Timer;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 /// Helper-macro for getting the current buffer without angering the borrow checker
 macro_rules! current_buf {
@@ -56,44 +55,60 @@ macro_rules! println_err {
     };
 }
 
-/// Margin when scrolling
-const SCROLL_MARGIN: u16 = 10;
+/// Vertical scroll margin
+const SCROLL_MARGIN_V: u16 = 18;
+/// Horizontal scroll margin
+const SCROLL_MARGIN_H: u16 = 4;
 /// Whether to insert spaces on TAB press
 const TAB_INSERTS_SPACES: bool = false;
 /// Tab display width / n.o. spaces to convert to
 const TAB_WIDTH: usize = 8;
+// 5 nums/padding + 1 space
+const LINUM_WIDTH: usize = 6;
+
+/// The width in columns of a string if it is displayed in a terminal.
+///
+/// Takes into account the current configuration of tab-width
+fn display_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    s.graphemes(true).map(|g| if g == "\t" { TAB_WIDTH } else { g.width() }).sum()
+}
 
 #[derive(Clone, Copy)]
 struct Point {
-    /// 0-based index of, approximatively, glyphs
-    x: usize,
-    /// x-position in glyphs before moving vertically.
+    /// 0-based index of, hopefully, column in terminal
     ///
-    /// Used to keep track of x-position when moving along lines
-    /// that might be shorter than current x-position
-    prev_x: usize,
-    /// 0-based line index
-    y: usize,
-    /// Byte index in line of points x-position
-    x_byte_i: usize,
+    /// E.g. a grapheme that consists of 8 bytes, but should be rendered as
+    /// a half-width glyph / single monospace, will count as 1 column.
+    /// Because of the nature of fonts and the unicode standard, this might
+    /// not always be the case, which means that this value might be incorrect.
+    /// This should, however, only affect the rendered appearance of the cursor
+    /// in relation to the text, and it should not happen often.
+    col: usize,
+    /// The byte-index corresponding to `self.col` in the current line string
+    col_byte_i: usize,
+    /// Column index before moving vertically.
+    ///
+    /// Used to keep track of column when moving along lines
+    /// that might be shorter than current line
+    prev_col: usize,
+    /// 0-based index of line in memory
+    line_i: usize,
 }
 
 impl Point {
     fn new() -> Point {
         Point {
-            x: 0,
-            prev_x: 0,
-            y: 0,
-            x_byte_i: 0,
+            col: 0,
+            prev_col: 0,
+            line_i: 0,
+            col_byte_i: 0,
         }
     }
 
-    /// Update the grapheme x-coordinate of the position in buffer `buf`
-    fn update_x(&mut self, buf: &Buf) {
-        self.x = buf.lines[self.y].data[0..self.x_byte_i]
-            .graphemes(true)
-            .map(|g| if g == "\t" { TAB_WIDTH } else { g.width() })
-            .sum();
+    /// Update the column-position of the point in buffer `buf`
+    fn update_col(&mut self, buf: &Buf) {
+        self.col = display_width(&buf.lines[self.line_i].data[0..self.col_byte_i]);
     }
 }
 
@@ -103,36 +118,29 @@ struct Line {
     ///
     /// Used to determine whether to redraw when rendering
     changed: bool,
-    /// Track width in graphemes of `data`
-    width: usize,
 }
 
 impl Line {
     fn new(s: String) -> Line {
-        let w = s.width();
         Line {
             data: s,
             changed: true,
-            width: w,
         }
     }
 
     fn insert_str(&mut self, i: usize, s: &str) {
         self.data.insert_str(i, s);
         self.changed = true;
-        self.width = self.data.width();
     }
 
     fn push_str(&mut self, s: &str) {
         self.data.push_str(s);
         self.changed = true;
-        self.width = self.data.width();
     }
 
     fn remove(&mut self, i: usize) {
         self.data.remove(i);
         self.changed = true;
-        self.width = self.data.width();
     }
 }
 
@@ -187,8 +195,10 @@ enum Cmd {
 }
 
 struct View {
-    /// 0-based position of top of view based on drawn lines
-    y: usize,
+    /// The line-index of the topmost line of the view
+    top_line_i: usize,
+    /// The column-index of the leftmost column of the view
+    left_col_i: usize,
     /// Track whether the view has moved/changed.
     ///
     /// Used to determine whether to redraw everything when rendering
@@ -240,7 +250,8 @@ impl TedTui {
             stdout: stdout().into_raw_mode().unwrap(),
             point: Point::new(),
             view: View {
-                y: 0,
+                top_line_i: 0,
+                left_col_i: 0,
                 changed: true,
             },
             current_buf_name: "*scratch*".to_string(),
@@ -248,22 +259,17 @@ impl TedTui {
         }
     }
 
-    /// Update the grapheme x coordinate of the pointer based on
-    /// the horizontal byte index and the current configuration
-    fn update_point_x(&mut self) {
-        self.point.update_x(current_buf!(self))
-    }
-
     /// Insert a string at point
     fn insert_str_at_point(&mut self, s: &str) {
+        let buf = &mut current_buf_mut!(self);
         {
-            let line = &mut current_buf_mut!(self).lines[self.point.y];
-            line.insert_str(self.point.x_byte_i, s);
+            let line = &mut buf.lines[self.point.line_i];
+            line.insert_str(self.point.col_byte_i, s);
         }
 
-        self.point.x_byte_i += s.len();
-        self.update_point_x();
-        self.point.prev_x = self.point.x;
+        self.point.col_byte_i += s.len();
+        self.point.update_col(buf);
+        self.point.prev_col = self.point.col;
     }
 
     /// Insert a character at point
@@ -279,35 +285,35 @@ impl TedTui {
         let buf = current_buf!(self);
 
         'a: loop {
-            if let Some(line) = buf.lines.get(self.point.y) {
-                let offset = self.point.x_byte_i;
-                let is = line.data[self.point.x_byte_i..]
+            if let Some(line) = buf.lines.get(self.point.line_i) {
+                let offset = self.point.col_byte_i;
+                let is = line.data[self.point.col_byte_i..]
                     .grapheme_indices(true)
                     .map(|(i, _)| i + offset)
                     .chain(once(line.data.len()));
                 for i in is {
                     if n == 0 {
-                        self.point.x_byte_i = i;
-                        self.point.update_x(buf);
-                        self.point.prev_x = self.point.x;
+                        self.point.col_byte_i = i;
+                        self.point.update_col(buf);
+                        self.point.prev_col = self.point.col;
 
                         return false;
                     } else {
                         n -= 1;
                     }
                 }
-                if self.point.y + 1 == buf.lines.len() {
-                    self.point.update_x(buf);
-                    self.point.prev_x = self.point.x;
+                if self.point.line_i + 1 == buf.lines.len() {
+                    self.point.update_col(buf);
+                    self.point.prev_col = self.point.col;
 
                     return true;
                 } else {
-                    self.point.y += 1;
-                    self.point.x_byte_i = 0;
+                    self.point.line_i += 1;
+                    self.point.col_byte_i = 0;
                 }
             } else {
-                self.point.update_x(buf);
-                self.point.prev_x = self.point.x;
+                self.point.update_col(buf);
+                self.point.prev_col = self.point.col;
 
                 return true;
             }
@@ -319,40 +325,40 @@ impl TedTui {
     fn move_point_backward(&mut self, mut n: usize) -> bool {
         let buf = current_buf!(self);
 
-        let mut line = &buf.lines[self.point.y];
+        let mut line = &buf.lines[self.point.line_i];
         'a: loop {
-            let grapheme_indices_rev = if line.data.len() == self.point.x_byte_i {
-                Box::new(line.data[0..self.point.x_byte_i]
+            let grapheme_indices_rev = if line.data.len() == self.point.col_byte_i {
+                Box::new(line.data[0..self.point.col_byte_i]
                     .grapheme_indices(true)
                     .map(|(i, _)| i)
-                    .chain(once(self.point.x_byte_i))
+                    .chain(once(self.point.col_byte_i))
                     .rev()) as Box<Iterator<Item = usize>>
             } else {
-                Box::new(line.data[0..(self.point.x_byte_i + 1)]
+                Box::new(line.data[0..(self.point.col_byte_i + 1)]
                     .grapheme_indices(true)
                     .map(|(i, _)| i)
                     .rev()) as Box<Iterator<Item = usize>>
             };
             for i in grapheme_indices_rev {
-                let beginning_reached = self.point.y == 0 && i == 0;
+                let beginning_reached = self.point.line_i == 0 && i == 0;
                 if n == 0 || beginning_reached {
-                    self.point.x_byte_i = i;
-                    self.point.update_x(buf);
-                    self.point.prev_x = self.point.x;
+                    self.point.col_byte_i = i;
+                    self.point.update_col(buf);
+                    self.point.prev_col = self.point.col;
 
                     return beginning_reached;
                 } else {
                     n -= 1;
                 }
             }
-            self.point.y -= 1;
+            self.point.line_i -= 1;
 
-            if let Some(prev_line) = buf.lines.get(self.point.y) {
+            if let Some(prev_line) = buf.lines.get(self.point.line_i) {
                 line = prev_line;
-                self.point.x_byte_i = line.data.len();
+                self.point.col_byte_i = line.data.len();
             } else {
-                self.point.update_x(buf);
-                self.point.prev_x = self.point.x;
+                self.point.update_col(buf);
+                self.point.prev_col = self.point.col;
 
                 return true;
             }
@@ -366,48 +372,51 @@ impl TedTui {
         let buf = current_buf!(self);
         let n_lines = buf.lines.len();
 
-        let end_of_buf = if self.point.y as isize + n >= n_lines as isize {
-            self.point.y = n_lines - 1;
+        let end_of_buf = if self.point.line_i as isize + n >= n_lines as isize {
+            self.point.line_i = n_lines - 1;
             false
-        } else if (self.point.y as isize) + n < 0 {
-            self.point.y = 0;
+        } else if (self.point.line_i as isize) + n < 0 {
+            self.point.line_i = 0;
             false
         } else {
-            self.point.y = (self.point.y as isize + n) as usize;
+            self.point.line_i = (self.point.line_i as isize + n) as usize;
             true
         };
 
-        let line = &buf.lines[self.point.y].data;
-        self.point.x = 0;
-        self.point.x_byte_i = 0;
+        let line = &buf.lines[self.point.line_i].data;
+        self.point.col = 0;
+        self.point.col_byte_i = 0;
         for (i, g) in line.grapheme_indices(true) {
-            let w = g.width();
-            if self.point.x + w > self.point.prev_x {
-                self.point.x_byte_i = i;
+            let w = display_width(g);
+            if self.point.col + w > self.point.prev_col {
+                self.point.col_byte_i = i;
                 return end_of_buf;
             }
-            self.point.x += w;
+            self.point.col += w;
         }
-        self.point.x_byte_i = line.len();
+        self.point.col_byte_i = line.len();
         end_of_buf
     }
+
+    // TODO: More generic deletion.
+    //       Something like `delete-selection`
 
     /// Return true if at end of buffer
     fn delete_forward_at_point(&mut self) -> bool {
         let buf = current_buf_mut!(self);
         let n_lines = buf.lines.len();
 
-        self.point.prev_x = self.point.x;
+        self.point.prev_col = self.point.col;
 
-        if self.point.x_byte_i < buf.lines[self.point.y].data.len() {
-            buf.lines[self.point.y].remove(self.point.x_byte_i);
+        if self.point.col_byte_i < buf.lines[self.point.line_i].data.len() {
+            buf.lines[self.point.line_i].remove(self.point.col_byte_i);
 
             false
-        } else if self.point.y < n_lines - 1 {
-            let next_line = buf.lines.remove(self.point.y + 1);
-            buf.lines[self.point.y].push_str(&next_line.data);
+        } else if self.point.line_i < n_lines - 1 {
+            let next_line = buf.lines.remove(self.point.line_i + 1);
+            buf.lines[self.point.line_i].push_str(&next_line.data);
 
-            for changed_or_moved_line in &mut buf.lines[self.point.y..] {
+            for changed_or_moved_line in &mut buf.lines[self.point.line_i..] {
                 changed_or_moved_line.changed = true;
             }
             false
@@ -420,36 +429,39 @@ impl TedTui {
     fn delete_backward_at_point(&mut self) -> bool {
         let buf = current_buf_mut!(self);
 
-        if self.point.x > 0 {
+        if self.point.col > 0 {
             let i = {
-                let line = &mut buf.lines[self.point.y];
-                let (i, _) =
-                    line.data[0..self.point.x_byte_i].grapheme_indices(true).rev().next().unwrap();
+                let line = &mut buf.lines[self.point.line_i];
+                let (i, _) = line.data[0..self.point.col_byte_i]
+                    .grapheme_indices(true)
+                    .rev()
+                    .next()
+                    .unwrap();
 
                 line.remove(i);
                 i
             };
-            self.point.x_byte_i = i;
-            self.point.update_x(buf);
-            self.point.prev_x = self.point.x;
+            self.point.col_byte_i = i;
+            self.point.update_col(buf);
+            self.point.prev_col = self.point.col;
 
             false
-        } else if self.point.y > 0 {
-            let line = buf.lines.remove(self.point.y);
+        } else if self.point.line_i > 0 {
+            let line = buf.lines.remove(self.point.line_i);
 
-            self.point.x_byte_i = buf.lines[self.point.y - 1].data.len();
-            self.point.y -= 1;
-            self.point.update_x(buf);
-            self.point.prev_x = self.point.x;
+            self.point.col_byte_i = buf.lines[self.point.line_i - 1].data.len();
+            self.point.line_i -= 1;
+            self.point.update_col(buf);
+            self.point.prev_col = self.point.col;
 
-            buf.lines[self.point.y].push_str(&line.data);
+            buf.lines[self.point.line_i].push_str(&line.data);
 
-            for changed_or_moved_line in &mut buf.lines[self.point.y..] {
+            for changed_or_moved_line in &mut buf.lines[self.point.line_i..] {
                 changed_or_moved_line.changed = true;
             }
             false
         } else {
-            self.point.prev_x = self.point.x;
+            self.point.prev_col = self.point.col;
 
             true
         }
@@ -457,19 +469,18 @@ impl TedTui {
 
     fn newline(&mut self) {
         let buf = current_buf_mut!(self);
-        let rest = buf.lines[self.point.y].data.split_off(self.point.x_byte_i);
-        buf.lines[self.point.y].width = buf.lines[self.point.y].data.width();
+        let rest = buf.lines[self.point.line_i].data.split_off(self.point.col_byte_i);
 
-        buf.lines.insert(self.point.y + 1, Line::new(rest));
+        buf.lines.insert(self.point.line_i + 1, Line::new(rest));
 
-        for changed_or_moved_line in &mut buf.lines[self.point.y..] {
+        for changed_or_moved_line in &mut buf.lines[self.point.line_i..] {
             changed_or_moved_line.changed = true;
         }
 
-        self.point.y += 1;
-        self.point.x_byte_i = 0;
-        self.point.x = 0;
-        self.point.prev_x = 0;
+        self.point.line_i += 1;
+        self.point.col_byte_i = 0;
+        self.point.col = 0;
+        self.point.prev_col = 0;
     }
 
     /// Insert tab or spaces
@@ -572,37 +583,41 @@ impl TedTui {
     }
 
     /// Position the view such that the cursor is visible.
-    ///
-    /// How exactly the view is positioned depends on the config value `SCROLL_MARGIN`
     fn reposition_view(&mut self) {
-        let h = self.term_size.1;
-        let point_draw_y = self.point_draw_pos().1;
-        let top_margin = self.view.y as i32 + SCROLL_MARGIN as i32;
-        let bot_margin = self.view.y as i32 + h as i32 - SCROLL_MARGIN as i32;
-        let move_relative_up = min(point_draw_y as i32 - top_margin, 0);
-        let move_relative_down = max(point_draw_y as i32 - bot_margin, 0);
+        let (w, h) = self.term_size;
+        let top_margin = self.view.top_line_i as i32 + SCROLL_MARGIN_V as i32;
+        let bot_margin = self.view.top_line_i as i32 + h as i32 - SCROLL_MARGIN_V as i32;
+        let move_relative_up = min(self.point.line_i as i32 - top_margin, 0);
+        let move_relative_down = max(self.point.line_i as i32 - bot_margin, 0) + move_relative_up;
 
         let bot = current_buf!(self).lines.len();
 
-        let view_y = min(bot,
-                         max(0,
-                             self.view.y as i32 + move_relative_up +
-                             move_relative_down) as usize);
-        if view_y != self.view.y {
+        let new_view_top = min(bot,
+                               max(0, self.view.top_line_i as i32 + move_relative_down) as usize);
+        if new_view_top != self.view.top_line_i {
             self.view.changed = true
         }
-        println_err!("h: {}, point_draw_y: {}, top_m: {}, bot_m: {}, up: {}, down: {}, bot: {}, \
-                      view_y: {}, view.y: {}",
-                     h,
-                     point_draw_y,
-                     top_margin,
-                     bot_margin,
-                     move_relative_up,
-                     move_relative_down,
-                     bot,
-                     view_y,
-                     self.view.y);
-        self.view.y = view_y;
+        self.view.top_line_i = new_view_top;
+
+        let left_margin = self.view.left_col_i as i32 + SCROLL_MARGIN_H as i32;
+        let right_margin = self.view.left_col_i as i32 + (w - LINUM_WIDTH as u16 - 1) as i32 -
+                           SCROLL_MARGIN_H as i32;
+        let move_relative_left = min(self.point.col as i32 - left_margin, 0);
+        let move_relative_right = max(self.point.col as i32 - right_margin, 0) + move_relative_left;
+
+        let right = current_buf!(self).lines[self.view.top_line_i..]
+            .iter()
+            .take(h as usize)
+            .map(|l| display_width(&l.data))
+            .max()
+            .unwrap_or(0);
+
+        let new_view_left = min(right,
+                                max(0, self.view.left_col_i as i32 + move_relative_right) as usize);
+        if new_view_left != self.view.left_col_i {
+            self.view.changed = true
+        }
+        self.view.left_col_i = new_view_left;
     }
 
     /// Get the message buf
@@ -633,6 +648,8 @@ impl TedTui {
         let c_bg = color::Bg(color::Rgb(0x18, 0x18, 0x10));
         let c_text = color::Fg(color::Rgb(0xF0, 0xE6, 0xD6));
         let c_dim_text = color::Fg(color::Rgb(0x60, 0x56, 0x50));
+        // At horizontal edges, mark a cell if line continues here on scroll
+        let c_line_continues = color::Bg(color::Rgb(0xF0, 0x40, 0x70));
         let term_size_changed = self.update_term_size();
         let (w, h) = self.term_size;
         let redraw_all = redraw == Redraw::All ||
@@ -645,95 +662,92 @@ impl TedTui {
                c_text,
                cursor::Hide)?;
 
-        let linum_width = 7;
-        /// Index of which row in terminal to draw on
-        let mut term_line_n = 1u16;
-        let mut i = 0;
-        while current_buf!(self).lines.get(i).is_some() {
-            let line_draw_y = self.n_draw_lines_before(i);
-            let line = &mut current_buf_mut!(self).lines[i];
-            let line_in_view = line_draw_y >= self.view.y &&
-                               line_draw_y <= self.view.y + h as usize;
-            let line_after_view = line_draw_y > self.view.y + h as usize;
+        let view_top_line_i = self.view.top_line_i;
+        let line_in_view =
+            |line_i| line_i >= view_top_line_i && line_i <= view_top_line_i + h as usize;
+        let should_redraw_line =
+            |line: &Line| (redraw_all || (redraw == Redraw::Changed && line.changed));
 
-            if line_after_view {
-                break;
-            } else if line_in_view {
-                let should_redraw_line = redraw_all || (redraw == Redraw::Changed && line.changed);
+        let buf = current_buf_mut!(self);
 
-                println_err!("line {} in view", i);
-                if should_redraw_line {
-                    println_err!("Redrawing line {}", i);
-                    write!(self.stdout, "{}", cursor::Goto(1, term_line_n))?;
-                    write!(self.stdout, "{}", termion::clear::CurrentLine)?;
-                    write!(self.stdout, "{}{:>5}. {}", c_dim_text, i + 1, c_text)?;
+        for (line_i, draw_y, line) in buf.lines
+                                         .iter_mut()
+                                         .enumerate()
+                                         .skip_while(|&(i, _)| !line_in_view(i))
+                                         .enumerate()
+                                         .map(|(y, (i, l))| (i, (y + 1) as u16, l))
+                                         .take_while(|&(i, _, _)| line_in_view(i))
+                                         .filter(|&(_, _, &mut ref l)| should_redraw_line(l)) {
 
-                    // Width of the line displayed in the terminal
-                    let mut draw_line_width = linum_width;
-                    for g in line.data.graphemes(true) {
-                        let s = if g == "\t" { &tab_spaces } else { g };
-                        let s_w = s.width();
+            write!(self.stdout, "{}", cursor::Goto(1, draw_y))?;
+            write!(self.stdout, "{}", termion::clear::CurrentLine)?;
 
-                        if draw_line_width + s_w <= w as usize {
-                            write!(self.stdout, "{}", s)?;
-                            draw_line_width += s_w;
-                        } else {
-                            term_line_n += 1;
-                            write!(self.stdout, "{}{}", cursor::Goto(1, term_line_n), s)?;
-                            draw_line_width = s_w;
-                        }
-                    }
-                    line.changed = false;
-                } else {
-                    term_line_n += ((linum_width + line.width) / w as usize) as u16;
+            let c_maybe_line_continues = if self.view.left_col_i > 0 && !line.data.is_empty() {
+                c_line_continues
+            } else {
+                c_bg
+            };
+
+            write!(self.stdout,
+                   "{}{}{:>5}{} {}{}",
+                   cursor::Goto(1, draw_y),
+                   c_dim_text,
+                   line_i + 1,
+                   c_maybe_line_continues,
+                   c_bg,
+                   c_text)?;
+
+            let view_left_col_i = self.view.left_col_i;
+            let grapheme_in_view = |end_col_i| {
+                // Reserve 1 column at the right end of view for marking
+                end_col_i > view_left_col_i &&
+                end_col_i <= view_left_col_i + (w as usize - LINUM_WIDTH)
+            };
+
+            for (end_col, g) in line.data
+                                    .graphemes(true)
+                                    .map(|g| if g == "\t" { &tab_spaces } else { g })
+                                    .scan(0, |end_col, g| {
+                                        *end_col += display_width(g);
+                                        Some((*end_col, g))
+                                    })
+                                    .skip_while(|&(end_col, _)| !grapheme_in_view(end_col)) {
+                if !grapheme_in_view(end_col) {
+                    // If the line keeps going beyond end of view,
+                    // put marker at edge to indicate continuation
+                    write!(self.stdout,
+                           "{}{} {}",
+                           cursor::Goto(w, draw_y),
+                           c_line_continues,
+                           c_bg)?;
+                    break;
                 }
-                term_line_n += 1;
+                write!(self.stdout, "{}", g)?;
             }
-            i += 1;
+            line.changed = false;
         }
-        write!(self.stdout,
-               "{}{}",
-               cursor::Goto(1, term_line_n),
-               termion::clear::AfterCursor)?;
+        let bot_line_y = (buf.lines.len() - self.view.top_line_i + 1) as u16;
+        if bot_line_y < h {
+            write!(self.stdout,
+                   "{}{}",
+                   cursor::Goto(1, bot_line_y),
+                   termion::clear::AfterCursor)?;
+        }
 
-        let (point_draw_x, point_draw_y) = self.point_draw_pos();
-        let (cursor_x, cursor_y) = (point_draw_x + 1, (point_draw_y - self.view.y) as u16 + 1);
-
+        let (cursor_x, cursor_y) =
+            ((1 + LINUM_WIDTH + self.point.col - self.view.left_col_i) as u16,
+             (self.point.line_i - self.view.top_line_i + 1) as u16);
         write!(self.stdout,
                "{}{}",
                cursor::Goto(cursor_x, cursor_y),
                cursor::Show)?;
 
-        self.term_size = (w, h);
         self.view.changed = false;
         self.stdout.flush()
     }
 
     fn redraw(&mut self, redraw: Redraw) {
         self._redraw(redraw).expect("Redraw failed")
-    }
-
-    fn n_draw_lines_before(&self, line_y: usize) -> usize {
-        let w = self.term_size.0;
-        current_buf!(self).lines[0..line_y]
-            .iter()
-            .map(|l| l.width / w as usize + 1)
-            .sum::<usize>()
-    }
-
-    /// Position of point when taking line wrap into account
-    ///
-    /// E.g., consider a single line that spans 100 lines in terminal when drawn, due to line wrap.
-    /// In line-coordinates, y is still 0, because it's the first line.
-    /// In drawn-line-coordinates, y might be anywhere from 1 to 100,
-    /// depending on where the cursor is.
-    fn point_draw_pos(&self) -> (u16, usize) {
-        let w = self.term_size.0;
-        let linum_width = 7;
-        let x = ((self.point.x + linum_width) % w as usize) as u16;
-        let preceding_n_draw_lines = self.n_draw_lines_before(self.point.y);
-        let y = preceding_n_draw_lines + (self.point.x + linum_width) / w as usize;
-        (x, y)
     }
 }
 
