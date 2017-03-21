@@ -68,6 +68,11 @@ fn display_width(s: &str) -> usize {
     s.graphemes(true).map(|g| if g == "\t" { TAB_WIDTH } else { g.width() }).sum()
 }
 
+
+fn n_spaces(n: usize) -> String {
+    (0..n).map(|_| ' ').collect::<String>()
+}
+
 /// Formatting of key events
 fn ted_key_to_string(k: Key) -> String {
     match k {
@@ -228,7 +233,7 @@ struct Window {
     w: u16,
     /// Height in terminal lines
     h: u16,
-    /// The index of the leftmose column of the buffer visible in the window
+    /// The index of the leftmost column of the buffer visible in the window
     left: usize,
     /// The index of the topmost line of the buffer visible in the window
     top: usize,
@@ -338,14 +343,15 @@ impl Window {
                     .map(|(i, _)| i)
                     .rev()) as Box<Iterator<Item = usize>>
             };
+
             for i in grapheme_indices_rev {
-                let beginning_reached = self.point.line_i == 0 && i == 0;
-                if n == 0 || beginning_reached {
+                let at_beginning = self.point.line_i == 0 && i == 0;
+                if n == 0 || at_beginning {
                     self.point.col_byte_i = i;
                     self.point.update_col_i(&buffer);
                     self.point.prev_col_i = self.point.col_i;
 
-                    return beginning_reached;
+                    return at_beginning && n > 0;
                 } else {
                     n -= 1;
                 }
@@ -373,13 +379,13 @@ impl Window {
 
         let end_of_buffer = if self.point.line_i as isize + n >= n_lines as isize {
             self.point.line_i = n_lines - 1;
-            false
+            true
         } else if (self.point.line_i as isize) + n < 0 {
             self.point.line_i = 0;
-            false
+            true
         } else {
             self.point.line_i = (self.point.line_i as isize + n) as usize;
-            true
+            false
         };
 
         let line = &buffer.lines[self.point.line_i].data;
@@ -657,13 +663,11 @@ impl Window {
                 write!(term, "{}", g)?;
                 last_col = end_col;
             }
-            write!(term,
-                   "{}",
-                   (last_col..(self.left + self.w as usize)).map(|_| ' ').collect::<String>())?;
+            write!(term, "{}", n_spaces(self.left + self.w as usize - last_col))?;
             line.changed = false;
         }
 
-        let clear_line = (0..self.w).map(|_| ' ').collect::<String>();
+        let clear_line = n_spaces(self.w as usize);
         let bot_line_y = start_y + (buffer.lines.len() - self.top) as u16;
         for y in bot_line_y..h {
             write!(term, "{}{}", cursor::Goto(start_x, y), &clear_line)?;
@@ -679,7 +683,7 @@ impl Window {
                        -> Result<(), io::Error> {
         let r = self.point.line_i as f32 / max(1, self.buffer.borrow().lines.len() - 1) as f32;
         let s = format!(" {}%", (r * 100.0).round() as u8);
-        let c = (display_width(&s)..(self.w as usize)).map(|_| ' ').collect::<String>();
+        let c = n_spaces(self.w as usize - display_width(&s));
         write!(term,
                "{}{}{}{}{}",
                cursor::Goto(x, y),
@@ -838,8 +842,67 @@ impl WindowPartition {
     }
 }
 
+struct Minibuffer {
+    w: u16,
+    window_stack: Vec<Window>,
+    _echo: Option<String>,
+    changed: bool,
+}
+
+impl Minibuffer {
+    fn new(w: u16) -> Minibuffer {
+        Minibuffer {
+            w: w,
+            window_stack: Vec::new(),
+            _echo: None,
+            changed: true,
+        }
+    }
+
+    fn set_width(&mut self, w: u16) {
+        self.w = w;
+        for window in &mut self.window_stack {
+            window.set_size(w, 2);
+        }
+        self.changed = true;
+    }
+
+    fn echo<S: Into<String>>(&mut self, s: S) {
+        self._echo = Some(s.into());
+        self.changed = true;
+    }
+
+    fn clear_echo(&mut self) {
+        self.changed |= self._echo.is_some();
+        self._echo = None;
+    }
+
+    fn redraw_at(&mut self,
+                 term: &mut RawTerminal<Stdout>,
+                 y: u16,
+                 redraw_all: bool)
+                 -> Result<(), io::Error> {
+        let redraw_all = redraw_all || self.changed;
+        let r = match (&self._echo, self.window_stack.last_mut()) {
+            (&Some(ref s), _) => write!(term,
+                                        "{}{}{}",
+                                        cursor::Goto(1, y),
+                                        s,
+                                        n_spaces(self.w as usize - display_width(s))),
+            (&None, Some(w)) => w.redraw_lines(term, 1, y, redraw_all),
+            (&None, None) if redraw_all => write!(term,
+                                                  "{}{}",
+                                                  cursor::Goto(1, y),
+                                                  n_spaces(self.w as usize)),
+            (&None, None) => Ok(()),
+        };
+        self.changed = false;
+        r
+    }
+}
+
+
 /// A frame of windows into buffers
-#[derive(Debug)]
 struct Frame {
     /// Width in terminal columns
     w: u16,
@@ -849,6 +912,7 @@ struct Frame {
     windows: Rc<RefCell<WindowPartition>>,
     /// The index of the active window in `self.windows`
     _active_window: Rc<RefCell<Window>>,
+    minibuffer: Minibuffer,
 }
 
 impl Frame {
@@ -859,6 +923,7 @@ impl Frame {
             h: 0,
             windows: windows,
             _active_window: window,
+            minibuffer: Minibuffer::new(0),
         }
     }
 
@@ -873,7 +938,8 @@ impl Frame {
     fn resize(&mut self, w: u16, h: u16) {
         self.w = w;
         self.h = h;
-        self.windows.borrow().set_size(w, h)
+        self.windows.borrow().set_size(w, h - 1);
+        self.minibuffer.set_width(w);
     }
 
     /// Check for change in terminal size. Update sizes as necessary
@@ -897,7 +963,8 @@ impl Frame {
         let term_size_changed = self.update_term_size();
         let redraw_all = redraw_all || term_size_changed;
 
-        self.windows.borrow().redraw_at(term, 1, 1, redraw_all)
+        self.windows.borrow().redraw_at(term, 1, 1, redraw_all)?;
+        self.minibuffer.redraw_at(term, self.h, redraw_all)
     }
 }
 
@@ -1045,7 +1112,9 @@ impl TedTui {
 
     /// Write a message to the *message* buffer
     fn message<S: Into<String>>(&mut self, msg: S) {
-        self.message_buffer_mut().lines.push(Line::new(msg.into()));
+        let msg = msg.into();
+        self.frame.minibuffer.echo(msg.clone());
+        self.message_buffer_mut().lines.push(Line::new(msg));
     }
 
     /// Returns whether to exit
@@ -1069,6 +1138,7 @@ impl TedTui {
     fn handle_event(&mut self, event: TuiEvent) -> bool {
         match event {
             TuiEvent::Key(k) => {
+                self.frame.minibuffer.clear_echo();
                 let exit = self.handle_key_event(k);
                 if exit {
                     return true;
@@ -1076,9 +1146,11 @@ impl TedTui {
             }
             TuiEvent::Update => (),
             TuiEvent::Mouse(_) => {
+                self.frame.minibuffer.clear_echo();
                 self.message(format!("Mousevent is undefined"));
             }
             TuiEvent::Unsupported(u) => {
+                self.frame.minibuffer.clear_echo();
                 self.message(format!("Unsupported event {:?}", u));
             }
         }
