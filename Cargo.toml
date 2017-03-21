@@ -15,5 +15,6 @@ termion = "1.2"
 tokio-timer = "0.1"
 unicode-segmentation = "1.1"
 unicode-width = "0.1"
+sequence_trie = "0.3.0"
 
 cpuprofiler = { version = "0.0", optional = true }

@@ -7,6 +7,7 @@ extern crate futures;
 extern crate tokio_timer;
 #[macro_use]
 extern crate lazy_static;
+extern crate sequence_trie;
 
 #[cfg(feature = "profiling")]
 extern crate cpuprofiler;
@@ -17,6 +18,7 @@ use clap::{Arg, App};
 use cpuprofiler::PROFILER;
 use futures::{Sink, Stream};
 use futures::sync::mpsc::channel;
+use sequence_trie::SequenceTrie;
 use std::{str, thread, fs};
 use std::cell::{RefCell, RefMut, Ref};
 use std::cmp::{max, min};
@@ -73,7 +75,6 @@ fn n_spaces(n: usize) -> String {
     (0..n).map(|_| ' ').collect::<String>()
 }
 
-/// Formatting of key events
 fn ted_key_to_string(k: Key) -> String {
     match k {
         Key::Ctrl(c) => format!("C-{}", c),
@@ -98,6 +99,19 @@ fn ted_key_to_string(k: Key) -> String {
         Key::Null => format!("<null>"),
         Key::__IsNotComplete => format!("UNSUPPORTED"),
     }
+}
+
+/// Formatting of key events
+fn ted_key_seq_to_string(ks: &[Key]) -> String {
+    let (first, rest) = ks.split_first().expect("Key slice empty");
+
+    let mut k_s = ted_key_to_string(first.clone());
+
+    for k in rest.iter().cloned() {
+        k_s.push(' ');
+        k_s.push_str(&ted_key_to_string(k))
+    }
+    k_s
 }
 
 /// A command to execute on e.g. a keypress
@@ -129,9 +143,11 @@ enum Cmd {
     Save,
     SplitH,
     SplitV,
+    /// Cancel a multi-key stroke or prompting command
+    Cancel,
 }
 
-type Keymap = HashMap<Key, Cmd>;
+type Keymap = SequenceTrie<Key, Cmd>;
 
 #[derive(Debug, Clone, Copy)]
 struct Point {
@@ -973,6 +989,7 @@ struct TedTui {
     global_keymap: Keymap,
     frame: Frame,
     term: RawTerminal<Stdout>,
+    key_seq: Vec<Key>,
 }
 
 impl TedTui {
@@ -982,27 +999,31 @@ impl TedTui {
         buffers.insert("*scratch*".to_string(), scratch.clone());
 
         let mut keymap = Keymap::new();
-        keymap.insert(Key::Ctrl('f'), Cmd::Forward);
-        keymap.insert(Key::Ctrl('b'), Cmd::Backward);
-        keymap.insert(Key::Ctrl('n'), Cmd::Downward);
-        keymap.insert(Key::Ctrl('p'), Cmd::Upward);
-        keymap.insert(Key::Ctrl('d'), Cmd::DeleteForward);
-        keymap.insert(Key::Delete, Cmd::DeleteForward);
-        keymap.insert(Key::Ctrl('h'), Cmd::DeleteBackward);
-        keymap.insert(Key::Backspace, Cmd::DeleteBackward);
-        keymap.insert(Key::Char('\n'), Cmd::Newline);
-        keymap.insert(Key::Char('\t'), Cmd::Tab);
-        keymap.insert(Key::Ctrl('s'), Cmd::Save);
-        keymap.insert(Key::Alt('g'), Cmd::GoToLine);
-        keymap.insert(Key::Esc, Cmd::Exit);
-        keymap.insert(Key::Ctrl('z'), Cmd::SplitV);
-        keymap.insert(Key::Ctrl('x'), Cmd::SplitH);
+        keymap.insert(&[Key::Ctrl('g')], Cmd::Cancel);
+
+        keymap.insert(&[Key::Ctrl('f')], Cmd::Forward);
+        keymap.insert(&[Key::Ctrl('b')], Cmd::Backward);
+        keymap.insert(&[Key::Ctrl('n')], Cmd::Downward);
+        keymap.insert(&[Key::Ctrl('p')], Cmd::Upward);
+        keymap.insert(&[Key::Ctrl('d')], Cmd::DeleteForward);
+        keymap.insert(&[Key::Delete], Cmd::DeleteForward);
+        keymap.insert(&[Key::Ctrl('h')], Cmd::DeleteBackward);
+        keymap.insert(&[Key::Backspace], Cmd::DeleteBackward);
+        keymap.insert(&[Key::Char('\n')], Cmd::Newline);
+        keymap.insert(&[Key::Char('\t')], Cmd::Tab);
+        keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('s')], Cmd::Save);
+        keymap.insert(&[Key::Alt('g')], Cmd::GoToLine);
+        keymap.insert(&[Key::Esc], Cmd::Exit);
+        keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('c')], Cmd::Exit);
+        keymap.insert(&[Key::Ctrl('x'), Key::Char('2')], Cmd::SplitV);
+        keymap.insert(&[Key::Ctrl('x'), Key::Char('3')], Cmd::SplitH);
 
         TedTui {
             buffers: buffers,
             global_keymap: keymap,
             frame: Frame::new(scratch),
             term: stdout().into_raw_mode().unwrap(),
+            key_seq: Vec::new(),
         }
     }
 
@@ -1092,6 +1113,7 @@ impl TedTui {
             Cmd::Save => self.active_window().save_file(),
             Cmd::SplitH => self.split_h(),
             Cmd::SplitV => self.split_v(),
+            Cmd::Cancel => self.message("Cancel"),
         }
         match r {
             MoveRes::Beg => self.message("Beginning of buffer"),
@@ -1119,18 +1141,56 @@ impl TedTui {
 
     /// Returns whether to exit
     fn handle_key_event(&mut self, key: Key) -> bool {
-        let mapped = {
+        /// Keymaps sorted by priority
+        fn keymaps_is_prefix(keymaps: &[&Keymap], key_seq: &[Key]) -> bool {
+            keymaps.iter()
+                   .any(|keymap| !keymap.get_node(key_seq).map(|n| n.is_empty()).unwrap_or(true))
+        }
+        fn keymaps_get(keymaps: &[&Keymap], key_seq: &[Key]) -> Option<Cmd> {
+            keymaps.iter().filter_map(|keymap| keymap.get(key_seq)).next().cloned()
+        }
+
+        self.key_seq.push(key);
+
+        let maybe_cmd = {
             let active_buffer = self.active_buffer();
             let active_buffer_b = active_buffer.borrow();
-            self.global_keymap.get(&key).or(active_buffer_b.local_keymap.get(&key)).cloned()
+            let keymaps = [&active_buffer_b.local_keymap, &self.global_keymap];
+
+            if let Some(Cmd::Cancel) = keymaps_get(&keymaps, &[key]) {
+                Some(Cmd::Cancel)
+            } else if let Some(cmd) = keymaps_get(&keymaps, &self.key_seq) {
+                self.key_seq.clear();
+                Some(cmd)
+            } else if keymaps_is_prefix(&keymaps, &self.key_seq) {
+                self.frame.minibuffer.echo(format!("{} ...", ted_key_seq_to_string(&self.key_seq)));
+                return false;
+            } else if let Key::Char(c) = key {
+                self.key_seq.clear();
+                Some(Cmd::Insert(c))
+            } else {
+                None
+            }
         };
-        if let Some(cmd) = mapped {
-            self.eval(&cmd)
-        } else if let Key::Char(c) = key {
-            self.eval(&Cmd::Insert(c))
-        } else {
-            self.message(format!("Key {} is undefined", ted_key_to_string(key)));
-            false
+
+        match maybe_cmd {
+            Some(Cmd::Cancel) => {
+                self.key_seq.pop();
+                if !self.key_seq.is_empty() {
+                    self.key_seq.clear();
+                    self.message("Key sequence canceled");
+                    false
+                } else {
+                    self.eval(&Cmd::Cancel)
+                }
+            }
+            Some(cmd) => self.eval(&cmd),
+            None => {
+                let s = format!("Key {} is undefined", ted_key_seq_to_string(&self.key_seq));
+                self.message(s);
+                self.key_seq.clear();
+                false
+            }
         }
     }
 
