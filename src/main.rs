@@ -553,8 +553,10 @@ impl Window {
     }
 
     fn set_size(&mut self, w: u16, h: u16) {
+        let changed = self.w != w || self.h != h;
         self.w = w;
         self.h = h;
+        self.changed |= changed;
     }
 
     /// Get the absolute position in terminal cells of this window in the frame
@@ -569,13 +571,11 @@ impl Window {
              G: FnOnce(u16, u16) -> ((u16, u16), (u16, u16))>
             (&mut self, split_dir: F, new_sizes: G) {
         let ((first_w, first_h), (second_w, second_h)) = new_sizes(self.w, self.h);
-        self.changed = true;
+
+        self.set_size(first_w, first_h);
 
         let second_window =
             Rc::new(RefCell::new(Window { w: second_w, h: second_h, ..self.clone() }));
-
-        self.w = first_w;
-        self.h = first_h;
 
         let parent_rc = self.parent_partition.upgrade().unwrap();
         let mut parent = parent_rc.borrow_mut();
@@ -604,19 +604,19 @@ impl Window {
         self.split(_WindowPartition::SplitV, |w, h| ((w, h / 2), (w, h / 2)))
     }
 
-    fn redraw_at(&mut self,
-                 term: &mut RawTerminal<Stdout>,
-                 start_x: u16,
-                 start_y: u16,
-                 redraw_all: bool)
-                 -> Result<(), io::Error> {
+    fn redraw_lines(&mut self,
+                    term: &mut RawTerminal<Stdout>,
+                    start_x: u16,
+                    start_y: u16,
+                    redraw_all: bool)
+                    -> Result<(), io::Error> {
         let redraw_all = redraw_all || self.changed;
 
         let tab_spaces = String::from_utf8(vec![' ' as u8; TAB_WIDTH]).unwrap();
         let mut buffer = self.buffer.borrow_mut();
         let (top, h) = (self.top, self.h);
 
-        let line_in_view = |line_i| line_i >= top && line_i <= top + (h - 1) as usize;
+        let line_in_view = |line_i| line_i >= top && line_i <= top + (h - 2) as usize;
         let should_redraw_line = |line: &Line| (redraw_all || line.changed);
 
         write!(term,
@@ -668,9 +668,38 @@ impl Window {
         for y in bot_line_y..h {
             write!(term, "{}{}", cursor::Goto(start_x, y), &clear_line)?;
         }
-
-        self.changed = false;
         Ok(())
+    }
+
+    fn redraw_modeline(&mut self,
+                       term: &mut RawTerminal<Stdout>,
+                       x: u16,
+                       y: u16,
+                       redraw_all: bool)
+                       -> Result<(), io::Error> {
+        let r = self.point.line_i as f32 / max(1, self.buffer.borrow().lines.len() - 1) as f32;
+        let s = format!(" {}%", (r * 100.0).round() as u8);
+        let c = (display_width(&s)..(self.w as usize)).map(|_| ' ').collect::<String>();
+        write!(term,
+               "{}{}{}{}{}",
+               cursor::Goto(x, y),
+               termion::style::Invert,
+               s,
+               c,
+               termion::style::NoInvert)
+    }
+
+    fn redraw_at(&mut self,
+                 term: &mut RawTerminal<Stdout>,
+                 start_x: u16,
+                 start_y: u16,
+                 redraw_all: bool)
+                 -> Result<(), io::Error> {
+        self.redraw_lines(term, start_x, start_y, redraw_all)?;
+        let h = self.h;
+        let r = self.redraw_modeline(term, start_x, start_y + h - 1, redraw_all);
+        self.changed = false;
+        r
     }
 }
 
