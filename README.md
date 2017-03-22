@@ -29,3 +29,9 @@ All assets of the environment are configurable and fully programmable through a 
 - [ ] Application launcher
 - [ ] Tray
 - [ ] Probably a lot more?
+
+## License
+
+TedWM is distributed under the terms of the GPLv3 license.
+
+See LICENSE for details.
