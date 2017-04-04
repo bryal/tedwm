@@ -647,15 +647,14 @@ impl Window {
                *COLOR_BG,
                *COLOR_TEXT)?;
 
-        for (_, draw_y, line) in
-            buffer.lines
-                  .iter_mut()
-                  .enumerate()
-                  .skip_while(|&(i, _)| !line_in_view(i))
-                  .enumerate()
-                  .map(|(y, (i, l))| (i, start_y + y as u16, l))
-                  .take_while(|&(i, _, _)| line_in_view(i))
-                  .filter(|&(_, _, &mut ref l)| should_redraw_line(l)) {
+        for (draw_y, line) in buffer.lines
+                                    .iter_mut()
+                                    .enumerate()
+                                    .skip_while(|&(i, _)| !line_in_view(i))
+                                    .take_while(|&(i, _)| line_in_view(i))
+                                    .enumerate()
+                                    .map(|(y, (_, l))| (start_y + y as u16, l))
+                                    .filter(|&(_, ref l)| should_redraw_line(l)) {
 
             write!(term, "{}", cursor::Goto(start_x, draw_y))?;
 
@@ -684,7 +683,9 @@ impl Window {
         }
 
         let clear_line = n_spaces(self.w as usize);
-        let bot_line_y = start_y + (buffer.lines.len() - self.top) as u16;
+        let bot_line_y = min(h as usize,
+                             start_y as usize + (buffer.lines.len() - self.top)) as
+                         u16;
         for y in bot_line_y..h {
             write!(term, "{}{}", cursor::Goto(start_x, y), &clear_line)?;
         }
@@ -963,7 +964,7 @@ impl Frame {
     /// Returns whether terminal size has changed
     fn update_term_size(&mut self) -> bool {
         let (w, h) = termion::terminal_size().expect("Failed to get terminal size");
-        let changed = self.w != w && self.h != h;
+        let changed = self.w != w || self.h != h;
 
         if changed {
             self.resize(w, h);
@@ -1230,15 +1231,10 @@ impl TedTui {
     fn redraw(&mut self, redraw_all: bool) {
         let (cursor_x, cursor_y) = self.cursor_pos();
 
-        println_err!("Cursor pos {}, {}", cursor_x, cursor_y);
+        let r1 = self.frame.redraw(&mut self.term, redraw_all);
+        let r2 = write!(self.term, "{}", cursor::Goto(cursor_x, cursor_y));
+        let r3 = self.term.flush();
 
-        let r1 = write!(self.term, "{}", cursor::Hide);
-        let r2 = self.frame.redraw(&mut self.term, redraw_all);
-        let r3 = write!(self.term,
-                        "{}{}",
-                        cursor::Show,
-                        cursor::Goto(cursor_x, cursor_y));
-        self.term.flush();
         r1.and(r2).and(r3).expect("Redraw failed");
     }
 }
