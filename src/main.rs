@@ -641,12 +641,6 @@ impl Window {
         let line_in_view = |line_i| line_i >= top && line_i <= top + (h - 2) as usize;
         let should_redraw_line = |line: &Line| (redraw_all || line.changed);
 
-        write!(term,
-               "{}{}{}",
-               cursor::Goto(start_x, start_y),
-               *COLOR_BG,
-               *COLOR_TEXT)?;
-
         for (draw_y, line) in buffer.lines
                                     .iter_mut()
                                     .enumerate()
@@ -689,6 +683,9 @@ impl Window {
         for y in bot_line_y..h {
             write!(term, "{}{}", cursor::Goto(start_x, y), &clear_line)?;
         }
+
+        self.changed = false;
+
         Ok(())
     }
 
@@ -821,22 +818,23 @@ impl WindowPartition {
         }
     }
 
-    fn redraw_at(&self,
+    fn redraw_at(&mut self,
                  term: &mut RawTerminal<Stdout>,
                  x: u16,
                  y: u16,
                  redraw_all: bool)
                  -> Result<(), io::Error> {
         let redraw_all = redraw_all || self.changed;
-        match self.content {
+
+        let r = match self.content {
             _WindowPartition::Window(ref window) => window.borrow_mut()
                                                           .redraw_at(term, x, y, redraw_all),
             _WindowPartition::SplitH(ref left, ref right) => {
-                let left = left.borrow();
+                let mut left = left.borrow_mut();
                 let (l_w, l_h) = left.size();
 
                 left.redraw_at(term, x, y, redraw_all)?;
-                let r = right.borrow().redraw_at(term, x + l_w + 1, y, redraw_all);
+                let r = right.borrow_mut().redraw_at(term, x + l_w + 1, y, redraw_all);
 
                 if redraw_all {
                     write!(term, "{}", *COLOR_DIM_TEXT)?;
@@ -849,13 +847,16 @@ impl WindowPartition {
                 }
             }
             _WindowPartition::SplitV(ref top, ref bot) => {
-                let top = top.borrow();
+                let mut top = top.borrow_mut();
                 let t_h = top.size().1;
 
                 top.redraw_at(term, x, y, redraw_all)?;
-                bot.borrow().redraw_at(term, x, y + t_h, redraw_all)
+                bot.borrow_mut().redraw_at(term, x, y + t_h, redraw_all)
             }
-        }
+        };
+
+        self.changed = false;
+        r
     }
 }
 
@@ -980,7 +981,7 @@ impl Frame {
         let term_size_changed = self.update_term_size();
         let redraw_all = redraw_all || term_size_changed;
 
-        self.windows.borrow().redraw_at(term, 1, 1, redraw_all)?;
+        self.windows.borrow_mut().redraw_at(term, 1, 1, redraw_all)?;
         self.minibuffer.redraw_at(term, self.h, redraw_all)
     }
 }
@@ -1231,11 +1232,15 @@ impl TedTui {
     fn redraw(&mut self, redraw_all: bool) {
         let (cursor_x, cursor_y) = self.cursor_pos();
 
-        let r1 = self.frame.redraw(&mut self.term, redraw_all);
-        let r2 = write!(self.term, "{}", cursor::Goto(cursor_x, cursor_y));
-        let r3 = self.term.flush();
+        let r1 = write!(self.term, "{}", cursor::Hide);
+        let r2 = self.frame.redraw(&mut self.term, redraw_all);
+        let r3 = write!(self.term,
+                        "{}{}",
+                        cursor::Show,
+                        cursor::Goto(cursor_x, cursor_y));
+        let r4 = self.term.flush();
 
-        r1.and(r2).and(r3).expect("Redraw failed");
+        r1.and(r2).and(r3).and(r4).expect("Redraw failed");
     }
 }
 
