@@ -59,7 +59,7 @@ lazy_static! {
     // At horizontal edges, mark a cell if line continues here on scroll
     static ref COLOR_BG_LINE_CONTINUES: color::Bg<color::Rgb> =
        color::Bg(color::Rgb(0xF0, 0x40, 0x70));
-    static ref COLOR_BG_MODELINE: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x99, 0x90, 0x80));
+    static ref COLOR_BG_MODELINE: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x39, 0x39, 0x30));
 }
 
 /// The width in columns of a string if it is displayed in a terminal.
@@ -193,27 +193,27 @@ struct Line {
     /// Track whether this line has been modified in buffer.
     ///
     /// Used to determine whether to redraw when rendering
-    changed: bool,
+    should_redraw: bool,
 }
 
 impl Line {
     fn new(s: String) -> Line {
-        Line { data: s, changed: true }
+        Line { data: s, should_redraw: true }
     }
 
     fn insert_str(&mut self, i: usize, s: &str) {
         self.data.insert_str(i, s);
-        self.changed = true;
+        self.should_redraw = true;
     }
 
     fn push_str(&mut self, s: &str) {
         self.data.push_str(s);
-        self.changed = true;
+        self.should_redraw = true;
     }
 
     fn remove(&mut self, i: usize) {
         self.data.remove(i);
-        self.changed = true;
+        self.should_redraw = true;
     }
 }
 
@@ -257,7 +257,7 @@ struct Window {
     /// has changed, etc.
     ///
     /// Used to determine what to redraw
-    changed: bool,
+    should_redraw: bool,
     parent_partition: Weak<RefCell<WindowPartition>>,
     buffer: Rc<RefCell<Buffer>>,
     point: Point,
@@ -274,7 +274,7 @@ impl Window {
             h: h,
             left: 0,
             top: 0,
-            changed: true,
+            should_redraw: true,
             parent_partition: parent,
             buffer: buffer,
             point: Point::new(),
@@ -438,7 +438,7 @@ impl Window {
             buffer.lines[self.point.line_i].push_str(&next_line.data);
 
             for changed_or_moved_line in &mut buffer.lines[self.point.line_i..] {
-                changed_or_moved_line.changed = true;
+                changed_or_moved_line.should_redraw = true;
             }
             false
         } else {
@@ -478,7 +478,7 @@ impl Window {
             buffer.lines[self.point.line_i].push_str(&line.data);
 
             for changed_or_moved_line in &mut buffer.lines[self.point.line_i..] {
-                changed_or_moved_line.changed = true;
+                changed_or_moved_line.should_redraw = true;
             }
             false
         } else {
@@ -495,7 +495,7 @@ impl Window {
         buffer.lines.insert(self.point.line_i + 1, Line::new(rest));
 
         for changed_or_moved_line in &mut buffer.lines[self.point.line_i..] {
-            changed_or_moved_line.changed = true;
+            changed_or_moved_line.should_redraw = true;
         }
 
         self.point.line_i += 1;
@@ -549,7 +549,7 @@ impl Window {
         let new_view_top = min(buf_bot,
                                max(0, self.top as i32 + move_relative_down) as usize);
         if new_view_top != self.top {
-            self.changed = true
+            self.should_redraw = true
         }
         self.top = new_view_top;
 
@@ -569,7 +569,7 @@ impl Window {
         let new_view_left = min(rightmost_col,
                                 max(0, self.left as i32 + move_relative_right) as usize);
         if new_view_left != self.left {
-            self.changed = true
+            self.should_redraw = true
         }
         self.left = new_view_left;
     }
@@ -578,7 +578,7 @@ impl Window {
         let changed = self.w != w || self.h != h;
         self.w = w;
         self.h = h;
-        self.changed |= changed;
+        self.should_redraw |= changed;
     }
 
     /// Get the absolute position in terminal cells of this window in the frame
@@ -607,14 +607,14 @@ impl Window {
 
         let second_partition = Rc::new(RefCell::new(WindowPartition {
             content: _WindowPartition::Window(second_window.clone()),
-            changed: true,
+            should_redraw: true,
             parent: Some(Rc::downgrade(&parent_rc)),
             is_first_child: false,
         }));
         second_window.borrow_mut().parent_partition = Rc::downgrade(&second_partition);
 
         parent.content = split_dir(first_partition, second_partition);
-        parent.changed = true;
+        parent.should_redraw = true;
     }
 
     fn split_h(&mut self) {
@@ -632,14 +632,14 @@ impl Window {
                     start_y: u16,
                     redraw_all: bool)
                     -> Result<(), io::Error> {
-        let redraw_all = redraw_all || self.changed;
+        let redraw_all = redraw_all || self.should_redraw;
 
         let tab_spaces = String::from_utf8(vec![' ' as u8; TAB_WIDTH]).unwrap();
         let mut buffer = self.buffer.borrow_mut();
         let (top, h) = (self.top, self.h);
 
         let line_in_view = |line_i| line_i >= top && line_i <= top + (h - 2) as usize;
-        let should_redraw_line = |line: &Line| (redraw_all || line.changed);
+        let should_redraw_line = |line: &Line| (redraw_all || line.should_redraw);
 
         for (draw_y, line) in buffer.lines
                                     .iter_mut()
@@ -673,7 +673,6 @@ impl Window {
                 last_col = end_col;
             }
             write!(term, "{}", n_spaces(self.left + self.w as usize - last_col))?;
-            line.changed = false;
         }
 
         let clear_line = n_spaces(self.w as usize);
@@ -683,8 +682,6 @@ impl Window {
         for y in bot_line_y..h {
             write!(term, "{}{}", cursor::Goto(start_x, y), &clear_line)?;
         }
-
-        self.changed = false;
 
         Ok(())
     }
@@ -701,10 +698,10 @@ impl Window {
         write!(term,
                "{}{}{}{}{}",
                cursor::Goto(x, y),
-               termion::style::Invert,
+               *COLOR_BG_MODELINE,
                s,
                c,
-               termion::style::NoInvert)
+               *COLOR_BG)
     }
 
     fn redraw_at(&mut self,
@@ -716,8 +713,21 @@ impl Window {
         self.redraw_lines(term, start_x, start_y, redraw_all)?;
         let h = self.h;
         let r = self.redraw_modeline(term, start_x, start_y + h - 1, redraw_all);
-        self.changed = false;
+        self.should_redraw = false;
         r
+    }
+
+    /// Mark this window and all relevant children as having been drawn
+    fn set_drawn(&mut self) {
+        self.should_redraw = false;
+
+        let lines = &mut self.buffer.borrow_mut().lines;
+
+        let (top, bot) = (self.top, min(lines.len(), self.top + self.h as usize));
+
+        for line in lines[top..bot].iter_mut() {
+            line.should_redraw = false;
+        }
     }
 }
 
@@ -731,7 +741,7 @@ enum _WindowPartition {
 #[derive(Debug, Clone)]
 struct WindowPartition {
     content: _WindowPartition,
-    changed: bool,
+    should_redraw: bool,
     parent: Option<Weak<RefCell<WindowPartition>>>,
     is_first_child: bool,
 }
@@ -742,7 +752,7 @@ impl WindowPartition {
         let window = Rc::new(RefCell::new(Window::new(0, 0, buffer, Weak::new())));
         let part = Rc::new(RefCell::new(WindowPartition {
             content: _WindowPartition::Window(window.clone()),
-            changed: true,
+            should_redraw: true,
             parent: None,
             is_first_child: true,
         }));
@@ -824,7 +834,7 @@ impl WindowPartition {
                  y: u16,
                  redraw_all: bool)
                  -> Result<(), io::Error> {
-        let redraw_all = redraw_all || self.changed;
+        let redraw_all = redraw_all || self.should_redraw;
 
         let r = match self.content {
             _WindowPartition::Window(ref window) => window.borrow_mut()
@@ -855,8 +865,26 @@ impl WindowPartition {
             }
         };
 
-        self.changed = false;
+        self.should_redraw = false;
         r
+    }
+
+    /// Mark this window partition and all it's children as having been drawn
+    /// as to not perform any unnecessary drawing next redraw
+    fn set_drawn(&mut self) {
+        self.should_redraw = false;
+
+        match self.content {
+            _WindowPartition::Window(ref window) => window.borrow_mut().set_drawn(),
+            _WindowPartition::SplitH(ref left, ref right) => {
+                left.borrow_mut().set_drawn();
+                right.borrow_mut().set_drawn();
+            }
+            _WindowPartition::SplitV(ref top, ref bot) => {
+                top.borrow_mut().set_drawn();
+                bot.borrow_mut().set_drawn();
+            }
+        }
     }
 }
 
@@ -864,7 +892,7 @@ struct Minibuffer {
     w: u16,
     window_stack: Vec<Window>,
     _echo: Option<String>,
-    changed: bool,
+    should_redraw: bool,
 }
 
 impl Minibuffer {
@@ -873,7 +901,7 @@ impl Minibuffer {
             w: w,
             window_stack: Vec::new(),
             _echo: None,
-            changed: true,
+            should_redraw: true,
         }
     }
 
@@ -882,16 +910,16 @@ impl Minibuffer {
         for window in &mut self.window_stack {
             window.set_size(w, 2);
         }
-        self.changed = true;
+        self.should_redraw = true;
     }
 
     fn echo<S: Into<String>>(&mut self, s: S) {
         self._echo = Some(s.into());
-        self.changed = true;
+        self.should_redraw = true;
     }
 
     fn clear_echo(&mut self) {
-        self.changed |= self._echo.is_some();
+        self.should_redraw |= self._echo.is_some();
         self._echo = None;
     }
 
@@ -900,7 +928,7 @@ impl Minibuffer {
                  y: u16,
                  redraw_all: bool)
                  -> Result<(), io::Error> {
-        let redraw_all = redraw_all || self.changed;
+        let redraw_all = redraw_all || self.should_redraw;
         let r = match (&self._echo, self.window_stack.last_mut()) {
             (&Some(ref s), _) => write!(term,
                                         "{}{}{}",
@@ -914,7 +942,7 @@ impl Minibuffer {
                                                   n_spaces(self.w as usize)),
             (&None, None) => Ok(()),
         };
-        self.changed = false;
+        self.should_redraw = false;
         r
     }
 }
@@ -974,6 +1002,12 @@ impl Frame {
         changed
     }
 
+    /// Mark all of the children of this frame as having been drawn
+    /// as to not perform any unnecessary drawing next redraw
+    fn set_drawn(&mut self) {
+        self.windows.borrow_mut().set_drawn()
+    }
+
     fn redraw(&mut self,
               term: &mut RawTerminal<Stdout>,
               redraw_all: bool)
@@ -982,7 +1016,11 @@ impl Frame {
         let redraw_all = redraw_all || term_size_changed;
 
         self.windows.borrow_mut().redraw_at(term, 1, 1, redraw_all)?;
-        self.minibuffer.redraw_at(term, self.h, redraw_all)
+        let r = self.minibuffer.redraw_at(term, self.h, redraw_all);
+
+        self.set_drawn();
+
+        r
     }
 }
 
@@ -1232,7 +1270,7 @@ impl TedTui {
     fn redraw(&mut self, redraw_all: bool) {
         let (cursor_x, cursor_y) = self.cursor_pos();
 
-        let r1 = write!(self.term, "{}", cursor::Hide);
+        let r1 = write!(self.term, "{}{}{}", cursor::Hide, *COLOR_BG, *COLOR_TEXT);
         let r2 = self.frame.redraw(&mut self.term, redraw_all);
         let r3 = write!(self.term,
                         "{}{}",
@@ -1307,6 +1345,7 @@ fn start_tui(opt_filename: Option<&str>) {
     if let Some(filename) = opt_filename {
         ted.open_file(filename);
     }
+
     ted.redraw(true);
 
     #[cfg(feature = "profiling")]
