@@ -24,7 +24,7 @@ use std::cell::{RefCell, RefMut, Ref};
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::io::{self, Write, stdout, stdin, Stdout, BufRead};
-use std::iter::once;
+use std::iter::{once, repeat};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -73,6 +73,13 @@ fn display_width(s: &str) -> usize {
 
 fn n_spaces(n: usize) -> String {
     (0..n).map(|_| ' ').collect::<String>()
+}
+
+/// Pad a line in the editor with spaces so that the number of symbols when printed will equal `len`
+fn pad_line(mut s: String, len: u16) -> String {
+    let padding = n_spaces(max(0, len as isize - display_width(&s) as isize) as usize);
+    s.push_str(&padding);
+    s
 }
 
 fn ted_key_to_string(k: Key) -> String {
@@ -190,30 +197,19 @@ impl Point {
 #[derive(Debug)]
 struct Line {
     data: String,
-    /// Track whether this line has been modified in buffer.
-    ///
-    /// Used to determine whether to redraw when rendering
-    should_redraw: bool,
 }
 
 impl Line {
     fn new(s: String) -> Line {
-        Line { data: s, should_redraw: true }
+        Line { data: s }
     }
 
     fn insert_str(&mut self, i: usize, s: &str) {
         self.data.insert_str(i, s);
-        self.should_redraw = true;
     }
 
     fn push_str(&mut self, s: &str) {
         self.data.push_str(s);
-        self.should_redraw = true;
-    }
-
-    fn remove(&mut self, i: usize) {
-        self.data.remove(i);
-        self.should_redraw = true;
     }
 }
 
@@ -253,11 +249,6 @@ struct Window {
     left: usize,
     /// The index of the topmost line of the buffer visible in the window
     top: usize,
-    /// Track whether the window has been resized or if the area of the buffer to show
-    /// has changed, etc.
-    ///
-    /// Used to determine what to redraw
-    should_redraw: bool,
     parent_partition: Weak<RefCell<WindowPartition>>,
     buffer: Rc<RefCell<Buffer>>,
     point: Point,
@@ -274,7 +265,6 @@ impl Window {
             h: h,
             left: 0,
             top: 0,
-            should_redraw: true,
             parent_partition: parent,
             buffer: buffer,
             point: Point::new(),
@@ -347,18 +337,11 @@ impl Window {
 
         let mut line = &buffer.lines[self.point.line_i];
         'a: loop {
-            let grapheme_indices_rev = if line.data.len() == self.point.col_byte_i {
-                Box::new(line.data[0..self.point.col_byte_i]
-                    .grapheme_indices(true)
-                    .map(|(i, _)| i)
-                    .chain(once(self.point.col_byte_i))
-                    .rev()) as Box<Iterator<Item = usize>>
-            } else {
-                Box::new(line.data[0..(self.point.col_byte_i + 1)]
-                    .grapheme_indices(true)
-                    .map(|(i, _)| i)
-                    .rev()) as Box<Iterator<Item = usize>>
-            };
+            let grapheme_indices_rev = line.data[0..self.point.col_byte_i]
+                .grapheme_indices(true)
+                .map(|(i, _)| i)
+                .chain(once(self.point.col_byte_i))
+                .rev();
 
             for i in grapheme_indices_rev {
                 let at_beginning = self.point.line_i == 0 && i == 0;
@@ -430,16 +413,18 @@ impl Window {
         self.point.prev_col_i = self.point.col_i;
 
         if self.point.col_byte_i < buffer.lines[self.point.line_i].data.len() {
-            buffer.lines[self.point.line_i].remove(self.point.col_byte_i);
+            let line = &mut buffer.lines[self.point.line_i].data;
+
+            let grapheme_len = line[self.point.col_byte_i..].graphemes(true).next().unwrap().len();
+            let (start, end) = (self.point.col_byte_i, self.point.col_byte_i + grapheme_len);
+
+            line.drain(start..end);
 
             false
         } else if self.point.line_i < n_lines - 1 {
             let next_line = buffer.lines.remove(self.point.line_i + 1);
             buffer.lines[self.point.line_i].push_str(&next_line.data);
 
-            for changed_or_moved_line in &mut buffer.lines[self.point.line_i..] {
-                changed_or_moved_line.should_redraw = true;
-            }
             false
         } else {
             true
@@ -450,21 +435,21 @@ impl Window {
     fn delete_backward_at_point(&mut self) -> bool {
         let mut buffer = self.buffer.borrow_mut();
 
-        if self.point.col_i > 0 {
+        let at_beginning = if self.point.col_i > 0 {
             let i = {
                 let line = &mut buffer.lines[self.point.line_i];
-                let (i, _) = line.data[0..self.point.col_byte_i]
+                let (i, len) = line.data[0..self.point.col_byte_i]
                     .grapheme_indices(true)
                     .rev()
                     .next()
+                    .map(|(i, g)| (i, g.len()))
                     .unwrap();
 
-                line.remove(i);
+                line.data.drain(i..(i + len));
                 i
             };
             self.point.col_byte_i = i;
             self.point.update_col_i(&buffer);
-            self.point.prev_col_i = self.point.col_i;
 
             false
         } else if self.point.line_i > 0 {
@@ -473,19 +458,16 @@ impl Window {
             self.point.col_byte_i = buffer.lines[self.point.line_i - 1].data.len();
             self.point.line_i -= 1;
             self.point.update_col_i(&buffer);
-            self.point.prev_col_i = self.point.col_i;
 
             buffer.lines[self.point.line_i].push_str(&line.data);
 
-            for changed_or_moved_line in &mut buffer.lines[self.point.line_i..] {
-                changed_or_moved_line.should_redraw = true;
-            }
             false
         } else {
-            self.point.prev_col_i = self.point.col_i;
-
             true
-        }
+        };
+        self.point.prev_col_i = self.point.col_i;
+
+        at_beginning
     }
 
     fn insert_new_line(&mut self) {
@@ -493,10 +475,6 @@ impl Window {
         let rest = buffer.lines[self.point.line_i].data.split_off(self.point.col_byte_i);
 
         buffer.lines.insert(self.point.line_i + 1, Line::new(rest));
-
-        for changed_or_moved_line in &mut buffer.lines[self.point.line_i..] {
-            changed_or_moved_line.should_redraw = true;
-        }
 
         self.point.line_i += 1;
         self.point.col_byte_i = 0;
@@ -548,9 +526,6 @@ impl Window {
 
         let new_view_top = min(buf_bot,
                                max(0, self.top as i32 + move_relative_down) as usize);
-        if new_view_top != self.top {
-            self.should_redraw = true
-        }
         self.top = new_view_top;
 
         let hor_margin = max(1, (self.w as f32 * SCROLL_MARGIN_H) as i32);
@@ -568,17 +543,12 @@ impl Window {
 
         let new_view_left = min(rightmost_col,
                                 max(0, self.left as i32 + move_relative_right) as usize);
-        if new_view_left != self.left {
-            self.should_redraw = true
-        }
         self.left = new_view_left;
     }
 
     fn set_size(&mut self, w: u16, h: u16) {
-        let changed = self.w != w || self.h != h;
         self.w = w;
         self.h = h;
-        self.should_redraw |= changed;
     }
 
     /// Get the absolute position in terminal cells of this window in the frame
@@ -607,14 +577,12 @@ impl Window {
 
         let second_partition = Rc::new(RefCell::new(WindowPartition {
             content: _WindowPartition::Window(second_window.clone()),
-            should_redraw: true,
             parent: Some(Rc::downgrade(&parent_rc)),
             is_first_child: false,
         }));
         second_window.borrow_mut().parent_partition = Rc::downgrade(&second_partition);
 
         parent.content = split_dir(first_partition, second_partition);
-        parent.should_redraw = true;
     }
 
     fn split_h(&mut self) {
@@ -626,109 +594,57 @@ impl Window {
         self.split(_WindowPartition::SplitV, |w, h| ((w, h / 2), (w, h / 2)))
     }
 
-    fn redraw_lines(&mut self,
-                    term: &mut RawTerminal<Stdout>,
-                    start_x: u16,
-                    start_y: u16,
-                    redraw_all: bool)
-                    -> Result<(), io::Error> {
-        let redraw_all = redraw_all || self.should_redraw;
+    fn render_lines(&self) -> Vec<String> {
+        fn h_cols(line: &str, left: usize, n_cols: u16) -> String {
+            let tab_spaces = n_spaces(TAB_WIDTH);
 
-        let tab_spaces = String::from_utf8(vec![' ' as u8; TAB_WIDTH]).unwrap();
-        let mut buffer = self.buffer.borrow_mut();
-        let (top, h) = (self.top, self.h);
-
-        let line_in_view = |line_i| line_i >= top && line_i <= top + (h - 2) as usize;
-        let should_redraw_line = |line: &Line| (redraw_all || line.should_redraw);
-
-        for (draw_y, line) in buffer.lines
-                                    .iter_mut()
-                                    .enumerate()
-                                    .skip_while(|&(i, _)| !line_in_view(i))
-                                    .take_while(|&(i, _)| line_in_view(i))
-                                    .enumerate()
-                                    .map(|(y, (_, l))| (start_y + y as u16, l))
-                                    .filter(|&(_, ref l)| should_redraw_line(l)) {
-
-            write!(term, "{}", cursor::Goto(start_x, draw_y))?;
-
-            let view_left_col_i = self.left;
-            let grapheme_in_view = |end_col_i| {
-                let right = view_left_col_i + self.w as usize;
-                end_col_i > view_left_col_i && end_col_i <= right
-            };
-            let mut last_col = 0;
-            for (end_col, g) in line.data
-                                    .graphemes(true)
-                                    .map(|g| if g == "\t" { &tab_spaces } else { g })
-                                    .scan(0, |end_col, g| {
-                                        *end_col += display_width(g);
-                                        Some((*end_col, g))
-                                    })
-                                    .skip_while(|&(end_col, _)| !grapheme_in_view(end_col)) {
-                if !grapheme_in_view(end_col) {
-                    break;
-                }
-                write!(term, "{}", g)?;
-                last_col = end_col;
-            }
-            write!(term, "{}", n_spaces(self.left + self.w as usize - last_col))?;
+            line.graphemes(true)
+                .scan(0, |col, g| if g == "\t" {
+                    *col += TAB_WIDTH;
+                    Some((*col, tab_spaces.as_str()))
+                } else {
+                    *col += display_width(g);
+                    Some((*col, g))
+                })
+                .skip_while(|&(end_col, _)| end_col <= left)
+                .take_while(|&(end_col, _)| end_col <= left + n_cols as usize)
+                .map(|(_, g)| g)
+                .collect()
         }
 
-        let clear_line = n_spaces(self.w as usize);
-        let bot_line_y = min(h as usize,
-                             start_y as usize + (buffer.lines.len() - self.top)) as
-                         u16;
-        for y in bot_line_y..h {
-            write!(term, "{}{}", cursor::Goto(start_x, y), &clear_line)?;
-        }
+        let buffer = self.buffer.borrow();
 
-        Ok(())
+        if buffer.lines.len() < self.top {
+            vec![n_spaces(self.w as usize); self.h as usize]
+        } else {
+            buffer.lines[self.top..]
+                .iter()
+                .map(|l| h_cols(&l.data, self.left, self.w))
+                .map(|l| pad_line(l.clone(), self.w))
+                .chain(repeat(n_spaces(self.w as usize)))
+                .take(self.h as usize - 1)
+                .collect()
+        }
     }
 
-    fn redraw_modeline(&mut self,
-                       term: &mut RawTerminal<Stdout>,
-                       x: u16,
-                       y: u16,
-                       redraw_all: bool)
-                       -> Result<(), io::Error> {
+    fn render_modeline(&self) -> String {
         let r = self.point.line_i as f32 / max(1, self.buffer.borrow().lines.len() - 1) as f32;
         let s = format!(" {}%", (r * 100.0).round() as u8);
-        let c = n_spaces(self.w as usize - display_width(&s));
-        write!(term,
-               "{}{}{}{}{}",
-               cursor::Goto(x, y),
-               *COLOR_BG_MODELINE,
-               s,
-               c,
-               *COLOR_BG)
+        format!("{}{}{}", *COLOR_BG_MODELINE, pad_line(s, self.w), *COLOR_BG)
     }
 
-    fn redraw_at(&mut self,
-                 term: &mut RawTerminal<Stdout>,
-                 start_x: u16,
-                 start_y: u16,
-                 redraw_all: bool)
-                 -> Result<(), io::Error> {
-        self.redraw_lines(term, start_x, start_y, redraw_all)?;
-        let h = self.h;
-        let r = self.redraw_modeline(term, start_x, start_y + h - 1, redraw_all);
-        self.should_redraw = false;
-        r
+    fn render(&self) -> Vec<String> {
+        let mut rendering_lines = self.render_lines();
+        rendering_lines.push(self.render_modeline());
+        rendering_lines
     }
+}
 
-    /// Mark this window and all relevant children as having been drawn
-    fn set_drawn(&mut self) {
-        self.should_redraw = false;
-
-        let lines = &mut self.buffer.borrow_mut().lines;
-
-        let (top, bot) = (self.top, min(lines.len(), self.top + self.h as usize));
-
-        for line in lines[top..bot].iter_mut() {
-            line.should_redraw = false;
-        }
-    }
+#[derive(PartialEq, Eq, Debug)]
+struct RenderingSection {
+    x: u16,
+    y: u16,
+    lines: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -741,7 +657,6 @@ enum _WindowPartition {
 #[derive(Debug, Clone)]
 struct WindowPartition {
     content: _WindowPartition,
-    should_redraw: bool,
     parent: Option<Weak<RefCell<WindowPartition>>>,
     is_first_child: bool,
 }
@@ -752,7 +667,6 @@ impl WindowPartition {
         let window = Rc::new(RefCell::new(Window::new(0, 0, buffer, Weak::new())));
         let part = Rc::new(RefCell::new(WindowPartition {
             content: _WindowPartition::Window(window.clone()),
-            should_redraw: true,
             parent: None,
             is_first_child: true,
         }));
@@ -828,61 +742,47 @@ impl WindowPartition {
         }
     }
 
-    fn redraw_at(&mut self,
-                 term: &mut RawTerminal<Stdout>,
-                 x: u16,
-                 y: u16,
-                 redraw_all: bool)
-                 -> Result<(), io::Error> {
-        let redraw_all = redraw_all || self.should_redraw;
-
-        let r = match self.content {
-            _WindowPartition::Window(ref window) => window.borrow_mut()
-                                                          .redraw_at(term, x, y, redraw_all),
-            _WindowPartition::SplitH(ref left, ref right) => {
-                let mut left = left.borrow_mut();
-                let (l_w, l_h) = left.size();
-
-                left.redraw_at(term, x, y, redraw_all)?;
-                let r = right.borrow_mut().redraw_at(term, x + l_w + 1, y, redraw_all);
-
-                if redraw_all {
-                    write!(term, "{}", *COLOR_DIM_TEXT)?;
-                    for y2 in y..(y + l_h) {
-                        write!(term, "{}|", cursor::Goto(x + l_w, y2))?;
-                    }
-                    r.and(write!(term, "{}", *COLOR_TEXT))
-                } else {
-                    r
-                }
-            }
-            _WindowPartition::SplitV(ref top, ref bot) => {
-                let mut top = top.borrow_mut();
-                let t_h = top.size().1;
-
-                top.redraw_at(term, x, y, redraw_all)?;
-                bot.borrow_mut().redraw_at(term, x, y + t_h, redraw_all)
-            }
-        };
-
-        self.should_redraw = false;
-        r
-    }
-
-    /// Mark this window partition and all it's children as having been drawn
-    /// as to not perform any unnecessary drawing next redraw
-    fn set_drawn(&mut self) {
-        self.should_redraw = false;
-
+    fn render(&self) -> Vec<RenderingSection> {
         match self.content {
-            _WindowPartition::Window(ref window) => window.borrow_mut().set_drawn(),
-            _WindowPartition::SplitH(ref left, ref right) => {
-                left.borrow_mut().set_drawn();
-                right.borrow_mut().set_drawn();
+            _WindowPartition::Window(ref window) => vec![RenderingSection {
+                                                             x: 0,
+                                                             y: 0,
+                                                             lines: window.borrow().render(),
+                                                         }],
+            _WindowPartition::SplitH(ref l, ref r) => {
+                let l = l.borrow();
+                let (l_w, l_h) = l.size();
+                let l_renderings = l.render();
+
+                let mut r_renderings = r.borrow().render();
+                for r_rendering in &mut r_renderings {
+                    r_rendering.x += l_w + 1
+                }
+
+                let mut separator_lines =
+                    repeat("|".to_string()).take(l_h as usize).collect::<Vec<_>>();
+                separator_lines[0].insert_str(0, &COLOR_DIM_TEXT.to_string());
+                separator_lines.last_mut()
+                               .expect("window partition height is 0")
+                               .push_str(&COLOR_TEXT.to_string());
+                let separator_rendering = RenderingSection { x: l_w, y: 0, lines: separator_lines };
+
+                l_renderings.into_iter()
+                            .chain(once(separator_rendering))
+                            .chain(r_renderings)
+                            .collect()
             }
             _WindowPartition::SplitV(ref top, ref bot) => {
-                top.borrow_mut().set_drawn();
-                bot.borrow_mut().set_drawn();
+                let top = top.borrow();
+                let top_h = top.size().1;
+                let top_renderings = top.render();
+
+                let mut bot_renderings = bot.borrow().render();
+                for bot_rendering in &mut bot_renderings {
+                    bot_rendering.y += top_h
+                }
+
+                top_renderings.into_iter().chain(bot_renderings).collect()
             }
         }
     }
@@ -892,7 +792,6 @@ struct Minibuffer {
     w: u16,
     window_stack: Vec<Window>,
     _echo: Option<String>,
-    should_redraw: bool,
 }
 
 impl Minibuffer {
@@ -901,7 +800,6 @@ impl Minibuffer {
             w: w,
             window_stack: Vec::new(),
             _echo: None,
-            should_redraw: true,
         }
     }
 
@@ -910,40 +808,34 @@ impl Minibuffer {
         for window in &mut self.window_stack {
             window.set_size(w, 2);
         }
-        self.should_redraw = true;
     }
 
-    fn echo<S: Into<String>>(&mut self, s: S) {
-        self._echo = Some(s.into());
-        self.should_redraw = true;
+    fn echo(&mut self, s: &str) {
+        if display_width(s) <= self.w as usize {
+            self._echo = Some(s.into())
+        } else {
+            let mut fitted = s.graphemes(true)
+                              .scan(0, |len, g| {
+                                  *len += display_width(g);
+                                  if *len < self.w as usize - 3 { Some(g) } else { None }
+                              })
+                              .collect::<String>();
+            fitted.push_str("...");
+
+            self._echo = Some(fitted);
+        }
     }
 
     fn clear_echo(&mut self) {
-        self.should_redraw |= self._echo.is_some();
         self._echo = None;
     }
 
-    fn redraw_at(&mut self,
-                 term: &mut RawTerminal<Stdout>,
-                 y: u16,
-                 redraw_all: bool)
-                 -> Result<(), io::Error> {
-        let redraw_all = redraw_all || self.should_redraw;
-        let r = match (&self._echo, self.window_stack.last_mut()) {
-            (&Some(ref s), _) => write!(term,
-                                        "{}{}{}",
-                                        cursor::Goto(1, y),
-                                        s,
-                                        n_spaces(self.w as usize - display_width(s))),
-            (&None, Some(w)) => w.redraw_lines(term, 1, y, redraw_all),
-            (&None, None) if redraw_all => write!(term,
-                                                  "{}{}",
-                                                  cursor::Goto(1, y),
-                                                  n_spaces(self.w as usize)),
-            (&None, None) => Ok(()),
-        };
-        self.should_redraw = false;
-        r
+    fn render(&self) -> Vec<String> {
+        match (self._echo.clone(), self.window_stack.last()) {
+            (Some(s), _) => vec![pad_line(s, self.w)],
+            (None, Some(w)) => w.render_lines(),
+            (None, None) => vec![n_spaces(self.w as usize)],
+        }
     }
 }
 
@@ -957,28 +849,25 @@ struct Frame {
     /// Windows into the buffers to show in this frame
     windows: Rc<RefCell<WindowPartition>>,
     /// The index of the active window in `self.windows`
-    _active_window: Rc<RefCell<Window>>,
+    active_window: Rc<RefCell<Window>>,
     minibuffer: Minibuffer,
 }
 
 impl Frame {
     fn new(buffer: Rc<RefCell<Buffer>>) -> Frame {
         let (windows, window) = WindowPartition::new_root_window(buffer);
-        Frame {
+
+        let mut f = Frame {
             w: 0,
             h: 0,
             windows: windows,
-            _active_window: window,
+            active_window: window,
             minibuffer: Minibuffer::new(0),
-        }
-    }
+        };
 
-    fn active_window(&self) -> Ref<Window> {
-        self._active_window.borrow()
-    }
+        f.update_term_size();
 
-    fn active_window_mut(&self) -> RefMut<Window> {
-        self._active_window.borrow_mut()
+        f
     }
 
     fn resize(&mut self, w: u16, h: u16) {
@@ -997,30 +886,22 @@ impl Frame {
 
         if changed {
             self.resize(w, h);
-            self.active_window_mut().reposition_view();
+            self.active_window.borrow_mut().reposition_view();
         }
         changed
     }
 
-    /// Mark all of the children of this frame as having been drawn
-    /// as to not perform any unnecessary drawing next redraw
-    fn set_drawn(&mut self) {
-        self.windows.borrow_mut().set_drawn()
-    }
+    fn render(&mut self) -> Vec<RenderingSection> {
+        let mut rendering_sections = self.windows.borrow().render();
+        let minibuffer_rendering = RenderingSection {
+            x: 0,
+            y: self.h - 1,
+            lines: self.minibuffer.render(),
+        };
 
-    fn redraw(&mut self,
-              term: &mut RawTerminal<Stdout>,
-              redraw_all: bool)
-              -> Result<(), io::Error> {
-        let term_size_changed = self.update_term_size();
-        let redraw_all = redraw_all || term_size_changed;
+        rendering_sections.push(minibuffer_rendering);
 
-        self.windows.borrow_mut().redraw_at(term, 1, 1, redraw_all)?;
-        let r = self.minibuffer.redraw_at(term, self.h, redraw_all);
-
-        self.set_drawn();
-
-        r
+        rendering_sections
     }
 }
 
@@ -1030,6 +911,7 @@ struct TedTui {
     frame: Frame,
     term: RawTerminal<Stdout>,
     key_seq: Vec<Key>,
+    prev_rendering_sections: Vec<RenderingSection>,
 }
 
 impl TedTui {
@@ -1064,15 +946,16 @@ impl TedTui {
             frame: Frame::new(scratch),
             term: stdout().into_raw_mode().unwrap(),
             key_seq: Vec::new(),
+            prev_rendering_sections: Vec::new(),
         }
     }
 
     fn active_window(&self) -> Ref<Window> {
-        self.frame.active_window()
+        self.frame.active_window.borrow()
     }
 
     fn active_window_mut(&self) -> RefMut<Window> {
-        self.frame.active_window_mut()
+        self.frame.active_window.borrow_mut()
     }
 
     fn active_buffer(&self) -> Rc<RefCell<Buffer>> {
@@ -1175,7 +1058,7 @@ impl TedTui {
     /// Write a message to the *message* buffer
     fn message<S: Into<String>>(&mut self, msg: S) {
         let msg = msg.into();
-        self.frame.minibuffer.echo(msg.clone());
+        self.frame.minibuffer.echo(&msg);
         self.message_buffer_mut().lines.push(Line::new(msg));
     }
 
@@ -1203,7 +1086,9 @@ impl TedTui {
                 self.key_seq.clear();
                 Some(cmd)
             } else if keymaps_is_prefix(&keymaps, &self.key_seq) {
-                self.frame.minibuffer.echo(format!("{} ...", ted_key_seq_to_string(&self.key_seq)));
+                self.frame
+                    .minibuffer
+                    .echo(&format!("{} ...", ted_key_seq_to_string(&self.key_seq)));
                 return false;
             } else if let Key::Char(c) = key {
                 self.key_seq.clear();
@@ -1254,7 +1139,8 @@ impl TedTui {
                 self.message(format!("Unsupported event {:?}", u));
             }
         }
-        self.redraw(false);
+        self.frame.update_term_size();
+        self.redraw();
         false
     }
 
@@ -1267,18 +1153,50 @@ impl TedTui {
          1 + window_y_absolute + cursor_y_relative_window)
     }
 
-    fn redraw(&mut self, redraw_all: bool) {
+    fn _redraw(&mut self) -> io::Result<()> {
         let (cursor_x, cursor_y) = self.cursor_pos();
+        let rendering_sections = self.frame.render();
 
-        let r1 = write!(self.term, "{}{}{}", cursor::Hide, *COLOR_BG, *COLOR_TEXT);
-        let r2 = self.frame.redraw(&mut self.term, redraw_all);
-        let r3 = write!(self.term,
-                        "{}{}",
-                        cursor::Show,
-                        cursor::Goto(cursor_x, cursor_y));
-        let r4 = self.term.flush();
+        write!(self.term, "{}", cursor::Hide)?;
 
-        r1.and(r2).and(r3).and(r4).expect("Redraw failed");
+        // Redraw modified sections
+        for (section, old_section) in
+            rendering_sections.iter()
+                              .zip(self.prev_rendering_sections
+                                       .iter()
+                                       .map(Some)
+                                       .chain(repeat(None))) {
+            let (same_pos, same_len) = old_section.map(|os| {
+                                                      ((os.x, os.y) == (section.x, section.y),
+                                                       os.lines.len() == section.lines.len())
+                                                  })
+                                                  .unwrap_or((false, false));
+
+            for (i, line) in section.lines.iter().enumerate() {
+                let old_line = old_section.and_then(|s| s.lines.get(i));
+
+                if !same_pos || !same_len || Some(line) != old_line {
+                    // If anything has changed, redraw
+                    write!(self.term,
+                           "{}{}",
+                           cursor::Goto(section.x + 1, section.y + i as u16 + 1),
+                           line)?
+                }
+            }
+        }
+
+        self.prev_rendering_sections = rendering_sections;
+
+        write!(self.term,
+               "{}{}",
+               cursor::Show,
+               cursor::Goto(cursor_x, cursor_y))?;
+
+        self.term.flush()
+    }
+
+    fn redraw(&mut self) {
+        self._redraw().expect("Redraw failed")
     }
 }
 
@@ -1306,7 +1224,7 @@ struct TuiEvents {
 }
 
 impl TuiEvents {
-    fn new(update_rate_hz: u64) -> Self {
+    fn with_update_period(update_period: Duration) -> Self {
         let (tx, term_read_event_rx) = channel(0);
 
         thread::spawn(|| {
@@ -1317,8 +1235,6 @@ impl TuiEvents {
             }
             tx.send(None).expect("Failed to send on channel");
         });
-
-        let update_period = Duration::from_millis(1000 / update_rate_hz);
 
         let timer = Timer::default();
         let update_event_stream =
@@ -1346,12 +1262,14 @@ fn start_tui(opt_filename: Option<&str>) {
         ted.open_file(filename);
     }
 
-    ted.redraw(true);
+    write!(ted.term, "{}{}", *COLOR_BG, *COLOR_TEXT).expect("Failed to reset colors");
+
+    ted.redraw();
 
     #[cfg(feature = "profiling")]
     PROFILER.lock().unwrap().start("./prof.profile").expect("Failed to start profiler");
 
-    for event in TuiEvents::new(5) {
+    for event in TuiEvents::with_update_period(Duration::from_millis(30)) {
         let exit = ted.handle_event(event);
         if exit {
             break;
