@@ -1406,7 +1406,7 @@ impl From<Event> for TuiEvent {
 
 /// Iterator for event loop of terminal events
 struct TuiEvents {
-    event_it: Box<Iterator<Item = Option<Result<TuiEvent, io::Error>>>>,
+    event_it: Box<Iterator<Item = TuiEvent>>,
 }
 
 impl TuiEvents {
@@ -1415,16 +1415,17 @@ impl TuiEvents {
 
         thread::spawn(|| {
             let mut tx = tx.wait();
-            while let Some(read_event_result) = stdin().events().next() {
-                tx.send(Some(read_event_result.map(TuiEvent::from)))
+
+            for read_event_result in stdin().events() {
+                tx.send(TuiEvent::from(read_event_result.expect("Failed to read terminal event")))
                   .expect("Failed to send on channel");
             }
-            tx.send(None).expect("Failed to send on channel");
+            panic!("No more events on stdin");
         });
 
         let timer = Timer::default();
         let update_event_stream =
-            timer.interval(update_period).map(|_| Some(Ok(TuiEvent::Update))).map_err(|_| ());
+            timer.interval(update_period).map(|_| TuiEvent::Update).map_err(|_| ());
 
         let event_it = term_read_event_rx.select(update_event_stream).wait().map(|r| r.unwrap());
 
@@ -1436,7 +1437,7 @@ impl Iterator for TuiEvents {
     type Item = TuiEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.event_it.next().unwrap().map(|result| result.expect("Failed to read terminal event"))
+        self.event_it.next()
     }
 }
 
