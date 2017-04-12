@@ -130,14 +130,10 @@ enum Cmd {
     Insert(char),
     /// Insert a tab or spaces
     Tab,
-    /// Move point a character forward
-    Forward,
-    /// Move point a character backward
-    Backward,
-    /// Move point a character downward
-    Downward,
-    /// Move point a character upward
-    Upward,
+    /// Move point n characters horizontally
+    MoveH(isize),
+    /// Move point n characters vertically
+    MoveV(isize),
     /// Delete a character forwards
     DeleteForward,
     /// Delete a character backwards
@@ -1067,10 +1063,10 @@ impl TedTui {
         let mut keymap = Keymap::new();
         keymap.insert(&[Key::Ctrl('g')], Cmd::Cancel);
 
-        keymap.insert(&[Key::Ctrl('f')], Cmd::Forward);
-        keymap.insert(&[Key::Ctrl('b')], Cmd::Backward);
-        keymap.insert(&[Key::Ctrl('n')], Cmd::Downward);
-        keymap.insert(&[Key::Ctrl('p')], Cmd::Upward);
+        keymap.insert(&[Key::Ctrl('f')], Cmd::MoveH(1));
+        keymap.insert(&[Key::Ctrl('b')], Cmd::MoveH(-1));
+        keymap.insert(&[Key::Ctrl('n')], Cmd::MoveV(-1));
+        keymap.insert(&[Key::Ctrl('p')], Cmd::MoveV(1));
         keymap.insert(&[Key::Ctrl('d')], Cmd::DeleteForward);
         keymap.insert(&[Key::Delete], Cmd::DeleteForward);
         keymap.insert(&[Key::Ctrl('h')], Cmd::DeleteBackward);
@@ -1175,10 +1171,8 @@ impl TedTui {
             Cmd::Insert(c) => {
                 self.active_window_mut().insert_char_at_point(c);
             }
-            Cmd::Forward => r = self.active_window_mut().move_point_h(1),
-            Cmd::Backward => r = self.active_window_mut().move_point_h(-1),
-            Cmd::Downward => r = self.active_window_mut().move_point_v(1),
-            Cmd::Upward => r = self.active_window_mut().move_point_v(-1),
+            Cmd::MoveH(n) => r = self.active_window_mut().move_point_h(n),
+            Cmd::MoveV(n) => r = self.active_window_mut().move_point_v(n),
             Cmd::DeleteForward => r = self.active_window_mut().delete_forward_at_point(),
             Cmd::DeleteBackward => r = self.active_window_mut().delete_backward_at_point(),
             Cmd::Newline => self.active_window_mut().insert_new_line(),
