@@ -59,7 +59,8 @@ lazy_static! {
     // At horizontal edges, mark a cell if line continues here on scroll
     static ref COLOR_BG_LINE_CONTINUES: color::Bg<color::Rgb> =
        color::Bg(color::Rgb(0xF0, 0x40, 0x70));
-    static ref COLOR_BG_MODELINE: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x39, 0x39, 0x30));
+    static ref COLOR_BG_MODELINE: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x4B, 0x4B, 0x40));
+    static ref COLOR_BG_MODELINE_INACTIVE: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x29, 0x29, 0x22));
 }
 
 /// The width in columns of a string if it is displayed in a terminal.
@@ -150,6 +151,8 @@ enum Cmd {
     Save,
     SplitH,
     SplitV,
+    /// Select the next window cyclically
+    NextWindow,
     /// Cancel a multi-key stroke or prompting command
     Cancel,
 }
@@ -252,6 +255,8 @@ struct Window {
     parent_partition: Weak<RefCell<WindowPartition>>,
     buffer: Rc<RefCell<Buffer>>,
     point: Point,
+    /// Whether this is the active window
+    is_active: bool,
 }
 
 impl Window {
@@ -268,6 +273,7 @@ impl Window {
             parent_partition: parent,
             buffer: buffer,
             point: Point::new(),
+            is_active: false,
         }
     }
 
@@ -553,7 +559,7 @@ impl Window {
 
     /// Get the absolute position in terminal cells of this window in the frame
     fn pos_in_frame(&self) -> (u16, u16) {
-        let parent = self.parent_partition.upgrade().unwrap();
+        let parent = self.parent_partition.upgrade().expect("Failed to upgrade parent");
         let parent_b = parent.borrow();
         parent_b.pos_in_frame()
     }
@@ -567,12 +573,19 @@ impl Window {
         self.set_size(first_w, first_h);
 
         let second_window =
-            Rc::new(RefCell::new(Window { w: second_w, h: second_h, ..self.clone() }));
+            Rc::new(RefCell::new(Window { w: second_w, h: second_h, is_active: false, ..self.clone() }));
 
-        let parent_rc = self.parent_partition.upgrade().unwrap();
+        let parent_rc = self.parent_partition.upgrade().expect("Failed to upgrade parent");
         let mut parent = parent_rc.borrow_mut();
 
         let first_partition = Rc::new(RefCell::new((*parent).clone()));
+
+        {
+            let mut first_b = first_partition.borrow_mut();
+            first_b.parent = Some(Rc::downgrade(&parent_rc));
+            first_b.is_first_child = true;
+        }
+                
         self.parent_partition = Rc::downgrade(&first_partition);
 
         let second_partition = Rc::new(RefCell::new(WindowPartition {
@@ -591,7 +604,15 @@ impl Window {
     }
 
     fn split_v(&mut self) {
-        self.split(_WindowPartition::SplitV, |w, h| ((w, h / 2), (w, h / 2)))
+        self.split(_WindowPartition::SplitV, |w, h| ((w, (h + 1) / 2), (w, h / 2)))
+    }
+
+    /// Returns the window following this window in the cycle
+    fn next_window(&self) -> Rc<RefCell<Window>> {
+        let parent = self.parent_partition.upgrade().expect("Failed to upgrade parent");
+        let next_leaf_partition = WindowPartition::next(parent);
+        let next_leaf_partition = next_leaf_partition.borrow();
+        next_leaf_partition.window().unwrap()
     }
 
     fn render_lines(&self) -> Vec<String> {
@@ -630,7 +651,8 @@ impl Window {
     fn render_modeline(&self) -> String {
         let r = self.point.line_i as f32 / max(1, self.buffer.borrow().lines.len() - 1) as f32;
         let s = format!(" {}%", (r * 100.0).round() as u8);
-        format!("{}{}{}", *COLOR_BG_MODELINE, pad_line(s, self.w), *COLOR_BG)
+        let bg = if self.is_active { &*COLOR_BG_MODELINE } else { &*COLOR_BG_MODELINE_INACTIVE };
+        format!("{}{}{}", bg, pad_line(s, self.w), *COLOR_BG)
     }
 
     fn render(&self) -> Vec<String> {
@@ -675,6 +697,7 @@ impl WindowPartition {
 
         (part, window)
     }
+
     fn size(&self) -> (u16, u16) {
         match self.content {
             _WindowPartition::Window(ref window) => {
@@ -725,7 +748,7 @@ impl WindowPartition {
             let (parent_x, parent_y) = parent.pos_in_frame();
 
             match parent.content {
-                _WindowPartition::Window(..) => (parent_x, parent_y),
+                _WindowPartition::Window(..) => unreachable!(),
                 _WindowPartition::SplitH(ref first, _) => if self.is_first_child {
                     (parent_x, parent_y)
                 } else {
@@ -739,6 +762,46 @@ impl WindowPartition {
             }
         } else {
             (0, 0)
+        }
+    }
+
+    fn window(&self) -> Option<Rc<RefCell<Window>>> {
+        match self.content {
+            _WindowPartition::Window(ref window) => Some(window.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns the next leaf partition in the cycle
+    fn next(this: Rc<RefCell<WindowPartition>>) -> Rc<RefCell<WindowPartition>> {
+        use _WindowPartition::*;
+
+        let this_b = this.borrow();
+
+        if let Some(ref parent_weak) = this_b.parent {
+            let parent = parent_weak.upgrade().expect("Failed to upgrade parent");
+            let parent_b = parent.borrow();
+
+            match parent_b.content {
+                Window(..) => unreachable!(),
+                SplitV(_, ref second) |
+                SplitH(_, ref second) if this_b.is_first_child => {
+                    WindowPartition::first_leaf(second.clone())
+                }
+                _ => WindowPartition::next(parent.clone()),
+            }
+        } else {
+            WindowPartition::first_leaf(this.clone())
+        }
+    }
+
+    /// Returns the leftmost, topmost leaf in this partition
+    fn first_leaf(this: Rc<RefCell<WindowPartition>>) -> Rc<RefCell<WindowPartition>> {
+        let this_b = this.borrow();
+        match this_b.content {
+            _WindowPartition::Window(_) => this.clone(),
+            _WindowPartition::SplitH(ref left, _) => WindowPartition::first_leaf(left.clone()),
+            _WindowPartition::SplitV(ref top, _) => WindowPartition::first_leaf(top.clone()),
         }
     }
 
@@ -865,6 +928,7 @@ impl Frame {
             minibuffer: Minibuffer::new(0),
         };
 
+        f.active_window.borrow_mut().is_active = true;
         f.update_term_size();
 
         f
@@ -939,6 +1003,7 @@ impl TedTui {
         keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('c')], Cmd::Exit);
         keymap.insert(&[Key::Ctrl('x'), Key::Char('2')], Cmd::SplitV);
         keymap.insert(&[Key::Ctrl('x'), Key::Char('3')], Cmd::SplitH);
+        keymap.insert(&[Key::Ctrl('x'), Key::Char('o')], Cmd::NextWindow);
 
         TedTui {
             buffers: buffers,
@@ -996,6 +1061,13 @@ impl TedTui {
         self.active_window_mut().split_v()
     }
 
+    fn select_next_window(&mut self) {
+        let next_window = self.frame.active_window.borrow().next_window();
+        self.frame.active_window.borrow_mut().is_active = false;
+        next_window.borrow_mut().is_active = true;
+        self.frame.active_window = next_window;
+    }
+
     /// Returns true if exit
     fn eval(&mut self, cmd: &Cmd) -> bool {
         enum MoveRes {
@@ -1036,6 +1108,7 @@ impl TedTui {
             Cmd::Save => self.active_window().save_file(),
             Cmd::SplitH => self.split_h(),
             Cmd::SplitV => self.split_v(),
+            Cmd::NextWindow => self.select_next_window(),
             Cmd::Cancel => self.message("Cancel"),
         }
         match r {
@@ -1154,7 +1227,6 @@ impl TedTui {
     }
 
     fn _redraw(&mut self) -> io::Result<()> {
-        let (cursor_x, cursor_y) = self.cursor_pos();
         let rendering_sections = self.frame.render();
 
         write!(self.term, "{}", cursor::Hide)?;
@@ -1186,6 +1258,8 @@ impl TedTui {
         }
 
         self.prev_rendering_sections = rendering_sections;
+
+        let (cursor_x, cursor_y) = self.cursor_pos();
 
         write!(self.term,
                "{}{}",
