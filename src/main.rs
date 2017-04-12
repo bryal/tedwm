@@ -246,6 +246,14 @@ impl Buffer {
     }
 }
 
+/// Describes whether a move was prevented by the point being at the
+/// beginning or end of buffer
+enum MoveRes {
+    Beg,
+    End,
+    Ok,
+}
+
 /// A window into a buffer
 #[derive(Debug, Clone)]
 struct Window {
@@ -302,100 +310,78 @@ impl Window {
         self.insert_str_at_point(c.encode_utf8(&mut s))
     }
 
-    /// Move point forward `n` graphemes
+    /// Move point horizontally by `n` graphemes
     ///
-    /// Returns true if end of buffer reached before finished
-    fn move_point_forward(&mut self, mut n: usize) -> bool {
+    /// Returns whether move was prevented by beginning/end of buffer
+    fn move_point_h(&mut self, mut n_with_dir: isize) -> MoveRes {
         let buffer = self.buffer.borrow();
 
-        'a: while let Some(line) = buffer.lines.get(self.point.line_i) {
-            let offset = self.point.col_byte_i;
-            let is = line.data[self.point.col_byte_i..]
-                .grapheme_indices(true)
-                .map(|(i, _)| i + offset)
-                .chain(once(line.data.len()));
-            for i in is {
+        let forward = n_with_dir >= 0;
+        let mut n = n_with_dir.abs() as usize;
+
+        let mut line = &buffer.lines[self.point.line_i];
+
+        loop {
+            let grapheme_byte_is = if forward {
+                let offset = self.point.col_byte_i;
+
+                Box::new(line.data[self.point.col_byte_i..]
+                    .grapheme_indices(true)
+                    .map(move |(i, _)| i + offset)
+                    .chain(once(line.data.len()))) as Box<Iterator<Item = _>>
+            } else {
+                Box::new(line.data[0..self.point.col_byte_i]
+                    .grapheme_indices(true)
+                    .map(|(i, _)| i)
+                    .chain(once(self.point.col_byte_i))
+                    .rev()) as Box<Iterator<Item = _>>
+            };
+
+            for i in grapheme_byte_is {
                 if n == 0 {
                     self.point.col_byte_i = i;
                     self.point.update_col_i(&buffer);
                     self.point.prev_col_i = self.point.col_i;
 
-                    return false;
+                    return MoveRes::Ok;
                 } else {
                     n -= 1;
                 }
             }
-            if self.point.line_i + 1 == buffer.lines.len() {
-                self.point.update_col_i(&buffer);
-                self.point.prev_col_i = self.point.col_i;
-
-                return true;
-            } else {
+            if forward {
+                if self.point.line_i + 1 >= buffer.lines.len() {
+                    return MoveRes::End;
+                }
                 self.point.line_i += 1;
+                line = &buffer.lines[self.point.line_i];
                 self.point.col_byte_i = 0;
-            }
-        }
-        self.point.update_col_i(&buffer);
-        self.point.prev_col_i = self.point.col_i;
-
-        true
-    }
-
-    /// Returns true if sucessfully moved backward n characters.
-    /// If beginning of buffer reached before n = 0, return true
-    fn move_point_backward(&mut self, mut n: usize) -> bool {
-        let buffer = self.buffer.borrow();
-
-        let mut line = &buffer.lines[self.point.line_i];
-        'a: loop {
-            let grapheme_indices_rev = line.data[0..self.point.col_byte_i]
-                .grapheme_indices(true)
-                .map(|(i, _)| i)
-                .chain(once(self.point.col_byte_i))
-                .rev();
-
-            for i in grapheme_indices_rev {
-                let at_beginning = self.point.line_i == 0 && i == 0;
-                if n == 0 || at_beginning {
-                    self.point.col_byte_i = i;
-                    self.point.update_col_i(&buffer);
-                    self.point.prev_col_i = self.point.col_i;
-
-                    return at_beginning && n > 0;
-                } else {
-                    n -= 1;
-                }
-            }
-            self.point.line_i -= 1;
-
-            if let Some(prev_line) = buffer.lines.get(self.point.line_i) {
-                line = prev_line;
-                self.point.col_byte_i = line.data.len();
             } else {
-                self.point.update_col_i(&buffer);
-                self.point.prev_col_i = self.point.col_i;
-
-                return true;
+                if self.point.line_i == 0 {
+                    return MoveRes::Beg;
+                }
+                self.point.line_i -= 1;
+                line = &buffer.lines[self.point.line_i];
+                self.point.col_byte_i = line.data.len();
             }
         }
     }
 
-    /// Move point upward (negative) or downward (positive)
+    /// Move point upward (negative) or downward (positive) by `n` lines
     ///
-    /// Return whether end/beginning of buffer reached
-    fn move_point_v(&mut self, n: isize) -> bool {
+    /// Returns whether move was prevented by beginning/end of buffer
+    fn move_point_v(&mut self, n: isize) -> MoveRes {
         let buffer = self.buffer.borrow();
         let n_lines = buffer.lines.len();
 
-        let end_of_buffer = if self.point.line_i as isize + n >= n_lines as isize {
+        let move_res = if self.point.line_i as isize + n >= n_lines as isize {
             self.point.line_i = n_lines - 1;
-            true
+            MoveRes::End
         } else if (self.point.line_i as isize) + n < 0 {
             self.point.line_i = 0;
-            true
+            MoveRes::Beg
         } else {
             self.point.line_i = (self.point.line_i as isize + n) as usize;
-            false
+            MoveRes::Ok
         };
 
         let line = &buffer.lines[self.point.line_i].data;
@@ -405,19 +391,21 @@ impl Window {
             let w = display_width(g);
             if self.point.col_i + w > self.point.prev_col_i {
                 self.point.col_byte_i = i;
-                return end_of_buffer;
+                return move_res;
             }
             self.point.col_i += w;
         }
         self.point.col_byte_i = line.len();
-        end_of_buffer
+        move_res
     }
 
     // TODO: More generic deletion.
     //       Something like `delete-selection`
 
-    /// Return true if at end of buffer
-    fn delete_forward_at_point(&mut self) -> bool {
+    /// Delete the grapheme infront of the cursor
+    ///
+    /// Returns whether deletion was prevented by end of buffer
+    fn delete_forward_at_point(&mut self) -> MoveRes {
         let mut buffer = self.buffer.borrow_mut();
         let n_lines = buffer.lines.len();
 
@@ -431,22 +419,24 @@ impl Window {
 
             line.drain(start..end);
 
-            false
+            MoveRes::Ok
         } else if self.point.line_i < n_lines - 1 {
             let next_line = buffer.lines.remove(self.point.line_i + 1);
             buffer.lines[self.point.line_i].push_str(&next_line.data);
 
-            false
+            MoveRes::Ok
         } else {
-            true
+            MoveRes::End
         }
     }
 
-    /// Return true if at beginning of buffer
-    fn delete_backward_at_point(&mut self) -> bool {
+    /// Delete the grapheme right behind the cursor
+    ///
+    /// Returns whether deletion was prevented by beginning of buffer
+    fn delete_backward_at_point(&mut self) -> MoveRes {
         let mut buffer = self.buffer.borrow_mut();
 
-        let at_beginning = if self.point.col_i > 0 {
+        if self.point.col_i > 0 {
             let i = {
                 let line = &mut buffer.lines[self.point.line_i];
                 let (i, len) = line.data[0..self.point.col_byte_i]
@@ -461,24 +451,24 @@ impl Window {
             };
             self.point.col_byte_i = i;
             self.point.update_col_i(&buffer);
+            self.point.prev_col_i = self.point.col_i;
 
-            false
+            MoveRes::Ok
         } else if self.point.line_i > 0 {
             let line = buffer.lines.remove(self.point.line_i);
 
             self.point.col_byte_i = buffer.lines[self.point.line_i - 1].data.len();
             self.point.line_i -= 1;
             self.point.update_col_i(&buffer);
+            self.point.prev_col_i = self.point.col_i;
 
             buffer.lines[self.point.line_i].push_str(&line.data);
 
-            false
+            MoveRes::Ok
         } else {
-            true
-        };
-        self.point.prev_col_i = self.point.col_i;
-
-        at_beginning
+            self.point.prev_col_i = self.point.col_i;
+            MoveRes::Beg
+        }
     }
 
     fn insert_new_line(&mut self) {
@@ -1180,40 +1170,20 @@ impl TedTui {
 
     /// Returns true if exit
     fn eval(&mut self, cmd: &Cmd) -> bool {
-        enum MoveRes {
-            Beg,
-            End,
-            Ok,
-        }
-
         let mut r = MoveRes::Ok;
         match *cmd {
             Cmd::Insert(c) => {
                 self.active_window_mut().insert_char_at_point(c);
             }
-            Cmd::Forward => if self.active_window_mut().move_point_forward(1) {
-                r = MoveRes::End
-            },
-            Cmd::Backward => if self.active_window_mut().move_point_backward(1) {
-                r = MoveRes::Beg
-            },
-            Cmd::Downward => if self.active_window_mut().move_point_v(1) {
-                r = MoveRes::End
-            },
-            Cmd::Upward => if self.active_window_mut().move_point_v(-1) {
-                r = MoveRes::Beg
-            },
-            Cmd::DeleteForward => if self.active_window_mut().delete_forward_at_point() {
-                r = MoveRes::End
-            },
-            Cmd::DeleteBackward => if self.active_window_mut().delete_backward_at_point() {
-                r = MoveRes::Beg
-            },
+            Cmd::Forward => r = self.active_window_mut().move_point_h(1),
+            Cmd::Backward => r = self.active_window_mut().move_point_h(-1),
+            Cmd::Downward => r = self.active_window_mut().move_point_v(1),
+            Cmd::Upward => r = self.active_window_mut().move_point_v(-1),
+            Cmd::DeleteForward => r = self.active_window_mut().delete_forward_at_point(),
+            Cmd::DeleteBackward => r = self.active_window_mut().delete_backward_at_point(),
             Cmd::Newline => self.active_window_mut().insert_new_line(),
             Cmd::Tab => self.active_window_mut().insert_tab(),
-            Cmd::Exit => {
-                return true;
-            }
+            Cmd::Exit => return true,
             Cmd::GoToLine => unimplemented!(),
             Cmd::Save => self.active_window().save_file(),
             Cmd::SplitH => self.split_h(),
