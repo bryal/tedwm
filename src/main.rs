@@ -19,7 +19,7 @@ use cpuprofiler::PROFILER;
 use futures::{Sink, Stream};
 use futures::sync::mpsc::channel;
 use sequence_trie::SequenceTrie;
-use std::{str, thread, fs};
+use std::{str, thread, fs, mem};
 use std::cell::{RefCell, RefMut, Ref};
 use std::cmp::{max, min};
 use std::collections::HashMap;
@@ -60,7 +60,8 @@ lazy_static! {
     static ref COLOR_BG_LINE_CONTINUES: color::Bg<color::Rgb> =
        color::Bg(color::Rgb(0xF0, 0x40, 0x70));
     static ref COLOR_BG_MODELINE: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x4B, 0x4B, 0x40));
-    static ref COLOR_BG_MODELINE_INACTIVE: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x29, 0x29, 0x22));
+    static ref COLOR_BG_MODELINE_INACTIVE: color::Bg<color::Rgb> =
+        color::Bg(color::Rgb(0x29, 0x29, 0x22));
 }
 
 /// The width in columns of a string if it is displayed in a terminal.
@@ -151,8 +152,12 @@ enum Cmd {
     Save,
     SplitH,
     SplitV,
-    /// Select the next window cyclically
-    NextWindow,
+    /// Delete the active window
+    DeleteWindow,
+    /// Delete all windows except active window
+    DeleteOtherWindows,
+    /// Select the nth window following or preceding the active window cyclically
+    OtherWindow(isize),
     /// Cancel a multi-key stroke or prompting command
     Cancel,
 }
@@ -252,7 +257,7 @@ struct Window {
     left: usize,
     /// The index of the topmost line of the buffer visible in the window
     top: usize,
-    parent_partition: Weak<RefCell<WindowPartition>>,
+    parent_partition: Weak<RefCell<Partition>>,
     buffer: Rc<RefCell<Buffer>>,
     point: Point,
     /// Whether this is the active window
@@ -263,7 +268,7 @@ impl Window {
     fn new(w: u16,
            h: u16,
            buffer: Rc<RefCell<Buffer>>,
-           parent: Weak<RefCell<WindowPartition>>)
+           parent: Weak<RefCell<Partition>>)
            -> Window {
         Window {
             w: w,
@@ -564,16 +569,22 @@ impl Window {
         parent_b.pos_in_frame()
     }
 
-    fn split<F: FnOnce(Rc<RefCell<WindowPartition>>, Rc<RefCell<WindowPartition>>)
-                       -> _WindowPartition,
+    fn split<F: FnOnce(Rc<RefCell<Partition>>, Rc<RefCell<Partition>>) -> _Partition,
              G: FnOnce(u16, u16) -> ((u16, u16), (u16, u16))>
-            (&mut self, split_dir: F, new_sizes: G) {
+        (&mut self,
+         split_dir: F,
+         new_sizes: G) {
+
         let ((first_w, first_h), (second_w, second_h)) = new_sizes(self.w, self.h);
 
         self.set_size(first_w, first_h);
 
-        let second_window =
-            Rc::new(RefCell::new(Window { w: second_w, h: second_h, is_active: false, ..self.clone() }));
+        let second_window = Rc::new(RefCell::new(Window {
+            w: second_w,
+            h: second_h,
+            is_active: false,
+            ..self.clone()
+        }));
 
         let parent_rc = self.parent_partition.upgrade().expect("Failed to upgrade parent");
         let mut parent = parent_rc.borrow_mut();
@@ -585,11 +596,11 @@ impl Window {
             first_b.parent = Some(Rc::downgrade(&parent_rc));
             first_b.is_first_child = true;
         }
-                
+
         self.parent_partition = Rc::downgrade(&first_partition);
 
-        let second_partition = Rc::new(RefCell::new(WindowPartition {
-            content: _WindowPartition::Window(second_window.clone()),
+        let second_partition = Rc::new(RefCell::new(Partition {
+            content: _Partition::Window(second_window.clone()),
             parent: Some(Rc::downgrade(&parent_rc)),
             is_first_child: false,
         }));
@@ -599,20 +610,30 @@ impl Window {
     }
 
     fn split_h(&mut self) {
-        self.split(_WindowPartition::SplitH,
-                   |w, h| ((w / 2, h), ((w - 1) / 2, h)))
+        self.split(_Partition::SplitH, |w, h| ((w / 2, h), ((w - 1) / 2, h)))
     }
 
     fn split_v(&mut self) {
-        self.split(_WindowPartition::SplitV, |w, h| ((w, (h + 1) / 2), (w, h / 2)))
+        self.split(_Partition::SplitV, |w, h| ((w, (h + 1) / 2), (w, h / 2)))
     }
 
-    /// Returns the window following this window in the cycle
-    fn next_window(&self) -> Rc<RefCell<Window>> {
+    /// Delete this window from parent and unsplit the partition
+    ///
+    /// If this window was the only child, do not delete and return `None`,
+    /// otherwise, return the first sibling
+    fn delete(&self) -> Option<Rc<RefCell<Window>>> {
         let parent = self.parent_partition.upgrade().expect("Failed to upgrade parent");
-        let next_leaf_partition = WindowPartition::next(parent);
-        let next_leaf_partition = next_leaf_partition.borrow();
-        next_leaf_partition.window().unwrap()
+        let parent_b = parent.borrow();
+        parent_b.delete().map(|part| part.borrow().first_window())
+    }
+
+    /// Select the `n`th window following or preceding this window
+    /// in cyclic ordering
+    fn other_window(&self, n: isize) -> Rc<RefCell<Window>> {
+        let parent = self.parent_partition.upgrade().expect("Failed to upgrade parent");
+        let other_leaf_partition = Partition::cycle(parent, n);
+        let other_leaf_partition = other_leaf_partition.borrow();
+        other_leaf_partition.window().expect("Other partition was not leaf partition")
     }
 
     fn render_lines(&self) -> Vec<String> {
@@ -670,25 +691,25 @@ struct RenderingSection {
 }
 
 #[derive(Debug, Clone)]
-enum _WindowPartition {
+enum _Partition {
     Window(Rc<RefCell<Window>>),
-    SplitH(Rc<RefCell<WindowPartition>>, Rc<RefCell<WindowPartition>>),
-    SplitV(Rc<RefCell<WindowPartition>>, Rc<RefCell<WindowPartition>>),
+    SplitH(Rc<RefCell<Partition>>, Rc<RefCell<Partition>>),
+    SplitV(Rc<RefCell<Partition>>, Rc<RefCell<Partition>>),
 }
 
 #[derive(Debug, Clone)]
-struct WindowPartition {
-    content: _WindowPartition,
-    parent: Option<Weak<RefCell<WindowPartition>>>,
+struct Partition {
+    content: _Partition,
+    parent: Option<Weak<RefCell<Partition>>>,
     is_first_child: bool,
 }
 
-impl WindowPartition {
-    fn new_root_window(buffer: Rc<RefCell<Buffer>>)
-                       -> (Rc<RefCell<WindowPartition>>, Rc<RefCell<Window>>) {
+impl Partition {
+    fn new_root_from_buffer(buffer: Rc<RefCell<Buffer>>)
+                            -> (Rc<RefCell<Partition>>, Rc<RefCell<Window>>) {
         let window = Rc::new(RefCell::new(Window::new(0, 0, buffer, Weak::new())));
-        let part = Rc::new(RefCell::new(WindowPartition {
-            content: _WindowPartition::Window(window.clone()),
+        let part = Rc::new(RefCell::new(Partition {
+            content: _Partition::Window(window.clone()),
             parent: None,
             is_first_child: true,
         }));
@@ -698,17 +719,29 @@ impl WindowPartition {
         (part, window)
     }
 
+    fn new_root_from_window(window: Rc<RefCell<Window>>) -> Rc<RefCell<Partition>> {
+        let part = Rc::new(RefCell::new(Partition {
+            content: _Partition::Window(window.clone()),
+            parent: None,
+            is_first_child: true,
+        }));
+
+        window.borrow_mut().parent_partition = Rc::downgrade(&part);
+
+        part
+    }
+
     fn size(&self) -> (u16, u16) {
         match self.content {
-            _WindowPartition::Window(ref window) => {
+            _Partition::Window(ref window) => {
                 let window = window.borrow();
                 (window.w, window.h)
             }
-            _WindowPartition::SplitH(ref left, ref right) => {
+            _Partition::SplitH(ref left, ref right) => {
                 let ((l_w, h), (r_w, _)) = (left.borrow().size(), right.borrow().size());
-                (l_w + r_w, h)
+                (l_w + 1 + r_w, h)
             }
-            _WindowPartition::SplitV(ref top, ref bot) => {
+            _Partition::SplitV(ref top, ref bot) => {
                 let ((w, t_h), (_, b_h)) = (top.borrow().size(), bot.borrow().size());
                 (w, t_h + b_h)
             }
@@ -720,18 +753,18 @@ impl WindowPartition {
 
         let (prev_w, prev_h) = self.size();
         match self.content {
-            _WindowPartition::Window(ref window) => window.borrow_mut().set_size(w, h),
-            _WindowPartition::SplitH(ref left, ref right) => {
+            _Partition::Window(ref window) => window.borrow_mut().set_size(w, h),
+            _Partition::SplitH(ref left, ref right) => {
                 let (left, right) = (left.borrow_mut(), right.borrow_mut());
-                let l_w = left.size().0;
+                let (l_w, _) = left.size();
                 let new_l_w = ((l_w as f32 / prev_w as f32) * w as f32) as u16;
                 let new_r_w = w - new_l_w - 1;
                 left.set_size(new_l_w, h);
                 right.set_size(new_r_w, h);
             }
-            _WindowPartition::SplitV(ref top, ref bot) => {
+            _Partition::SplitV(ref top, ref bot) => {
                 let (top, bot) = (top.borrow_mut(), bot.borrow_mut());
-                let t_h = top.size().0;
+                let (_, t_h) = top.size();
                 let new_t_h = ((t_h as f32 / prev_h as f32) * h as f32) as u16;
                 let new_b_h = h - new_t_h;
                 top.set_size(w, new_t_h);
@@ -748,13 +781,13 @@ impl WindowPartition {
             let (parent_x, parent_y) = parent.pos_in_frame();
 
             match parent.content {
-                _WindowPartition::Window(..) => unreachable!(),
-                _WindowPartition::SplitH(ref first, _) => if self.is_first_child {
+                _Partition::Window(..) => unreachable!(),
+                _Partition::SplitH(ref first, _) => if self.is_first_child {
                     (parent_x, parent_y)
                 } else {
                     (parent_x + 1 + first.borrow().size().0, parent_y)
                 },
-                _WindowPartition::SplitV(ref first, _) => if self.is_first_child {
+                _Partition::SplitV(ref first, _) => if self.is_first_child {
                     (parent_x, parent_y)
                 } else {
                     (parent_x, parent_y + first.borrow().size().1)
@@ -765,54 +798,111 @@ impl WindowPartition {
         }
     }
 
-    fn window(&self) -> Option<Rc<RefCell<Window>>> {
-        match self.content {
-            _WindowPartition::Window(ref window) => Some(window.clone()),
-            _ => None,
-        }
-    }
-
-    /// Returns the next leaf partition in the cycle
-    fn next(this: Rc<RefCell<WindowPartition>>) -> Rc<RefCell<WindowPartition>> {
-        use _WindowPartition::*;
-
+    /// Returns the `n`th leaf partition following or preceding this partition
+    fn cycle(this: Rc<RefCell<Partition>>, n: isize) -> Rc<RefCell<Partition>> {
         let this_b = this.borrow();
 
-        if let Some(ref parent_weak) = this_b.parent {
+        if n == 0 || this_b.parent.is_none() {
+            Partition::first_leaf(this.clone())
+        } else {
+            let parent_weak = this_b.parent.as_ref().unwrap();
             let parent = parent_weak.upgrade().expect("Failed to upgrade parent");
             let parent_b = parent.borrow();
 
             match parent_b.content {
-                Window(..) => unreachable!(),
-                SplitV(_, ref second) |
-                SplitH(_, ref second) if this_b.is_first_child => {
-                    WindowPartition::first_leaf(second.clone())
+                _Partition::Window(..) => unreachable!(),
+                _Partition::SplitV(_, ref second) |
+                _Partition::SplitH(_, ref second) if this_b.is_first_child => {
+                    Partition::cycle(Partition::first_leaf(second.clone()), n - 1)
                 }
-                _ => WindowPartition::next(parent.clone()),
+                _ => Partition::cycle(parent.clone(), n),
             }
-        } else {
-            WindowPartition::first_leaf(this.clone())
         }
     }
 
     /// Returns the leftmost, topmost leaf in this partition
-    fn first_leaf(this: Rc<RefCell<WindowPartition>>) -> Rc<RefCell<WindowPartition>> {
+    fn first_leaf(this: Rc<RefCell<Partition>>) -> Rc<RefCell<Partition>> {
         let this_b = this.borrow();
         match this_b.content {
-            _WindowPartition::Window(_) => this.clone(),
-            _WindowPartition::SplitH(ref left, _) => WindowPartition::first_leaf(left.clone()),
-            _WindowPartition::SplitV(ref top, _) => WindowPartition::first_leaf(top.clone()),
+            _Partition::Window(_) => this.clone(),
+            _Partition::SplitH(ref left, _) => Partition::first_leaf(left.clone()),
+            _Partition::SplitV(ref top, _) => Partition::first_leaf(top.clone()),
+        }
+    }
+
+    /// Returns the leftmost, topmost leaf in this partition
+    fn first_window(&self) -> Rc<RefCell<Window>> {
+        match self.content {
+            _Partition::Window(ref window) => window.clone(),
+            _Partition::SplitH(ref left, _) => left.borrow().first_window(),
+            _Partition::SplitV(ref top, _) => top.borrow().first_window(),
+        }
+    }
+
+    fn window(&self) -> Option<Rc<RefCell<Window>>> {
+        match self.content {
+            _Partition::Window(ref window) => Some(window.clone()),
+            _ => None,
+        }
+    }
+
+    /// Delete this partition from parent and unsplit the partition
+    ///
+    /// If this partition was the only child, do not delete and return `None`,
+    /// otherwise, return the sibling
+    fn delete(&self) -> Option<Rc<RefCell<Partition>>> {
+        fn set_children_parent(this: &Partition, new_parent: Weak<RefCell<Partition>>) {
+            match this.content {
+                _Partition::Window(ref window) => window.borrow_mut().parent_partition = new_parent,
+                _Partition::SplitH(ref first, ref second) |
+                _Partition::SplitV(ref first, ref second) => {
+                    first.borrow_mut().parent = Some(new_parent.clone());
+                    second.borrow_mut().parent = Some(new_parent);
+                }
+            }
+        }
+
+        if let Some(parent_weak) = self.parent.clone() {
+            let parent = parent_weak.upgrade().expect("Failed to upgrade parent");
+            let mut parent_b = parent.borrow_mut();
+            let (parent_w, parent_h) = parent_b.size();
+
+            let content = unsafe { mem::replace(&mut parent_b.content, mem::uninitialized()) };
+
+            let sibling = match content {
+                _Partition::Window(..) => unreachable!(),
+                _Partition::SplitV(first, second) |
+                _Partition::SplitH(first, second) => if self.is_first_child {
+                    second
+                } else {
+                    first
+                },
+            };
+
+            let sibling_owned = Rc::try_unwrap(sibling)
+                .expect("Sibling was not unique reference")
+                .into_inner();
+
+            sibling_owned.set_size(parent_w, parent_h);
+
+            set_children_parent(&sibling_owned, parent_weak);
+
+            parent_b.content = sibling_owned.content;
+
+            Some(parent.clone())
+        } else {
+            None
         }
     }
 
     fn render(&self) -> Vec<RenderingSection> {
         match self.content {
-            _WindowPartition::Window(ref window) => vec![RenderingSection {
-                                                             x: 0,
-                                                             y: 0,
-                                                             lines: window.borrow().render(),
-                                                         }],
-            _WindowPartition::SplitH(ref l, ref r) => {
+            _Partition::Window(ref window) => vec![RenderingSection {
+                                                       x: 0,
+                                                       y: 0,
+                                                       lines: window.borrow().render(),
+                                                   }],
+            _Partition::SplitH(ref l, ref r) => {
                 let l = l.borrow();
                 let (l_w, l_h) = l.size();
                 let l_renderings = l.render();
@@ -835,7 +925,7 @@ impl WindowPartition {
                             .chain(r_renderings)
                             .collect()
             }
-            _WindowPartition::SplitV(ref top, ref bot) => {
+            _Partition::SplitV(ref top, ref bot) => {
                 let top = top.borrow();
                 let top_h = top.size().1;
                 let top_renderings = top.render();
@@ -910,7 +1000,7 @@ struct Frame {
     /// Height in terminal lines
     h: u16,
     /// Windows into the buffers to show in this frame
-    windows: Rc<RefCell<WindowPartition>>,
+    windows: Rc<RefCell<Partition>>,
     /// The index of the active window in `self.windows`
     active_window: Rc<RefCell<Window>>,
     minibuffer: Minibuffer,
@@ -918,7 +1008,7 @@ struct Frame {
 
 impl Frame {
     fn new(buffer: Rc<RefCell<Buffer>>) -> Frame {
-        let (windows, window) = WindowPartition::new_root_window(buffer);
+        let (windows, window) = Partition::new_root_from_buffer(buffer);
 
         let mut f = Frame {
             w: 0,
@@ -1003,7 +1093,10 @@ impl TedTui {
         keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('c')], Cmd::Exit);
         keymap.insert(&[Key::Ctrl('x'), Key::Char('2')], Cmd::SplitV);
         keymap.insert(&[Key::Ctrl('x'), Key::Char('3')], Cmd::SplitH);
-        keymap.insert(&[Key::Ctrl('x'), Key::Char('o')], Cmd::NextWindow);
+        keymap.insert(&[Key::Ctrl('x'), Key::Char('0')], Cmd::DeleteWindow);
+        keymap.insert(&[Key::Ctrl('x'), Key::Char('1')], Cmd::DeleteOtherWindows);
+        keymap.insert(&[Key::Ctrl('x'), Key::Char('o')], Cmd::OtherWindow(1));
+        keymap.insert(&[Key::Ctrl('x'), Key::Char('i')], Cmd::OtherWindow(-1));
 
         TedTui {
             buffers: buffers,
@@ -1054,18 +1147,35 @@ impl TedTui {
     }
 
     fn split_h(&self) {
-        self.active_window_mut().split_h();
+        self.active_window_mut().split_h()
     }
 
     fn split_v(&mut self) {
         self.active_window_mut().split_v()
     }
 
-    fn select_next_window(&mut self) {
-        let next_window = self.frame.active_window.borrow().next_window();
+    fn select_other_window(&mut self, n: isize) {
+        let next_window = self.frame.active_window.borrow().other_window(n);
         self.frame.active_window.borrow_mut().is_active = false;
         next_window.borrow_mut().is_active = true;
         self.frame.active_window = next_window;
+    }
+
+    fn delete_active_window(&mut self) {
+        let maybe_sibling = self.frame.active_window.borrow().delete();
+
+        if let Some(sibling) = maybe_sibling {
+            sibling.borrow_mut().is_active = true;
+            self.frame.active_window = sibling;
+        } else {
+            self.frame.minibuffer.echo("Can't delete root window")
+        }
+    }
+
+    fn delete_inactive_windows(&mut self) {
+        let active_window = self.frame.active_window.clone();
+        self.frame.windows = Partition::new_root_from_window(active_window);
+        self.frame.active_window.borrow_mut().set_size(self.frame.w, self.frame.h);
     }
 
     /// Returns true if exit
@@ -1108,7 +1218,9 @@ impl TedTui {
             Cmd::Save => self.active_window().save_file(),
             Cmd::SplitH => self.split_h(),
             Cmd::SplitV => self.split_v(),
-            Cmd::NextWindow => self.select_next_window(),
+            Cmd::DeleteWindow => self.delete_active_window(),
+            Cmd::DeleteOtherWindows => self.delete_inactive_windows(),
+            Cmd::OtherWindow(n) => self.select_other_window(n),
             Cmd::Cancel => self.message("Cancel"),
         }
         match r {
