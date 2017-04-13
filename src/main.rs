@@ -19,8 +19,8 @@ use cpuprofiler::PROFILER;
 use futures::{Sink, Stream};
 use futures::sync::mpsc::channel;
 use sequence_trie::SequenceTrie;
-use std::{str, thread, fs, mem};
-use std::cell::{RefCell, RefMut, Ref};
+use std::{str, thread, fs, mem, ptr};
+use std::cell::{RefCell, RefMut};
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::io::{self, Write, stdout, stdin, Stdout, BufRead};
@@ -37,7 +37,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 macro_rules! println_err {
     ($fmt:expr $(, $args:expr )*) => {
-        writeln!(io::stderr(), $fmt, $($args),*).unwrap()
+        writeln!(io::stderr(), $fmt, $($args),*).expect("Failed to write to stderr")
     };
 }
 
@@ -124,7 +124,7 @@ fn ted_key_seq_to_string(ks: &[Key]) -> String {
 }
 
 /// A command to execute on e.g. a keypress
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Cmd {
     /// Insert a character into the buffer at point
     Insert(char),
@@ -154,13 +154,15 @@ enum Cmd {
     DeleteOtherWindows,
     /// Select the nth window following or preceding the active window cyclically
     OtherWindow(isize),
+    /// Submit the topmost prompt and send the input to the associated callback
+    PromptSubmit(Rc<Fn(&mut TedTui, &str)>),
     /// Cancel a multi-key stroke or prompting command
     Cancel,
 }
 
 type Keymap = SequenceTrie<Key, Cmd>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Point {
     /// 0-based index of, hopefully, column in terminal
     ///
@@ -198,7 +200,6 @@ impl Point {
     }
 }
 
-#[derive(Debug)]
 struct Line {
     data: String,
 }
@@ -220,7 +221,6 @@ impl Line {
 /// A buffer is a equivalent to a temporary file in memory.
 /// Could be purely temporary data, which does not exist in storage until saved,
 /// or simply a normal file loaded to memory for editing
-#[derive(Debug)]
 struct Buffer {
     lines: Vec<Line>,
     filepath: Option<PathBuf>,
@@ -240,6 +240,18 @@ impl Buffer {
     fn new_file_buffer(filepath: PathBuf) -> Self {
         Buffer { filepath: Some(filepath), ..Buffer::new() }
     }
+
+    fn to_string(&self) -> String {
+        self.lines
+            .split_last()
+            .map(|(last, init)| {
+                init.iter()
+                    .flat_map(|l| once(l.data.as_str()).chain(once("\n")))
+                    .chain(once(last.data.as_str()))
+                    .collect()
+            })
+            .unwrap_or(String::new())
+    }
 }
 
 /// Describes whether a move was prevented by the point being at the
@@ -251,7 +263,7 @@ enum MoveRes {
 }
 
 /// A window into a buffer
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Window {
     /// Width in terminal columns
     w: u16,
@@ -309,7 +321,7 @@ impl Window {
     /// Move point horizontally by `n` graphemes
     ///
     /// Returns whether move was prevented by beginning/end of buffer
-    fn move_point_h(&mut self, mut n_with_dir: isize) -> MoveRes {
+    fn move_point_h(&mut self, n_with_dir: isize) -> MoveRes {
         let buffer = self.buffer.borrow();
 
         let forward = n_with_dir >= 0;
@@ -362,21 +374,19 @@ impl Window {
         }
     }
 
-    /// Move point upward (negative) or downward (positive) by `n` lines
-    ///
-    /// Returns whether move was prevented by beginning/end of buffer
-    fn move_point_v(&mut self, n: isize) -> MoveRes {
+    /// Move point to an absolute line number
+    fn move_point_to_line(&mut self, line_i: isize) -> MoveRes {
         let buffer = self.buffer.borrow();
         let n_lines = buffer.lines.len();
 
-        let move_res = if self.point.line_i as isize + n >= n_lines as isize {
+        let move_res = if line_i >= n_lines as isize {
             self.point.line_i = n_lines - 1;
             MoveRes::End
-        } else if (self.point.line_i as isize) + n < 0 {
+        } else if line_i < 0 {
             self.point.line_i = 0;
             MoveRes::Beg
         } else {
-            self.point.line_i = (self.point.line_i as isize + n) as usize;
+            self.point.line_i = line_i as usize;
             MoveRes::Ok
         };
 
@@ -393,6 +403,33 @@ impl Window {
         }
         self.point.col_byte_i = line.len();
         move_res
+    }
+
+    /// Move point upward (negative) or downward (positive) by `n` lines
+    ///
+    /// Returns whether move was prevented by beginning/end of buffer
+    fn move_point_v(&mut self, n: isize) -> MoveRes {
+        let line_i = self.point.line_i as isize + n;
+
+        self.move_point_to_line(line_i)
+    }
+
+    /// Move point to the end of the line
+    fn move_point_to_end_of_line(&mut self) {
+        let buffer = self.buffer.borrow();
+        let line = &buffer.lines[self.point.line_i].data;
+        self.point.col_byte_i = line.len();
+        self.point.update_col_i(&buffer)
+    }
+
+    /// Move point to the end of the buffer
+    fn move_point_to_end_of_buffer(&mut self) {
+        {
+            let buffer = self.buffer.borrow();
+            let n_lines = buffer.lines.len();
+            self.point.line_i = n_lines - 1;
+        }
+        self.move_point_to_end_of_line()
     }
 
     // TODO: More generic deletion.
@@ -555,6 +592,18 @@ impl Window {
         parent_b.pos_in_frame()
     }
 
+    fn is_first_in_frame(&self) -> bool {
+        let parent = self.parent_partition.upgrade().expect("Failed to upgrade parent");
+        let parent_b = parent.borrow();
+        parent_b.is_first_in_frame()
+    }
+
+    fn is_last_in_frame(&self) -> bool {
+        let parent = self.parent_partition.upgrade().expect("Failed to upgrade parent");
+        let parent_b = parent.borrow();
+        parent_b.is_last_in_frame()
+    }
+
     fn split<F: FnOnce(Rc<RefCell<Partition>>, Rc<RefCell<Partition>>) -> _Partition,
              G: FnOnce(u16, u16) -> ((u16, u16), (u16, u16))>
         (&mut self,
@@ -614,7 +663,7 @@ impl Window {
     }
 
     /// Select the `n`th window following or preceding this window
-    /// in cyclic ordering
+    /// in cyclic ordering.
     fn other_window(&self, n: isize) -> Rc<RefCell<Window>> {
         let parent = self.parent_partition.upgrade().expect("Failed to upgrade parent");
         let other_leaf_partition = Partition::cycle(parent, n);
@@ -676,14 +725,14 @@ struct RenderingSection {
     lines: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum _Partition {
     Window(Rc<RefCell<Window>>),
     SplitH(Rc<RefCell<Partition>>, Rc<RefCell<Partition>>),
     SplitV(Rc<RefCell<Partition>>, Rc<RefCell<Partition>>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Partition {
     content: _Partition,
     parent: Option<Weak<RefCell<Partition>>>,
@@ -784,6 +833,24 @@ impl Partition {
         }
     }
 
+    fn is_first_in_frame(&self) -> bool {
+        if let Some(ref parent_weak) = self.parent {
+            let parent = parent_weak.upgrade().unwrap();
+            self.is_first_child && parent.borrow().is_first_in_frame()
+        } else {
+            true
+        }
+    }
+
+    fn is_last_in_frame(&self) -> bool {
+        if let Some(ref parent_weak) = self.parent {
+            let parent = parent_weak.upgrade().unwrap();
+            !self.is_first_child && parent.borrow().is_last_in_frame()
+        } else {
+            true
+        }
+    }
+
     /// Returns the `n`th leaf partition following or preceding this partition
     fn cycle(this: Rc<RefCell<Partition>>, n: isize) -> Rc<RefCell<Partition>> {
         let this_b = this.borrow();
@@ -822,6 +889,15 @@ impl Partition {
             _Partition::Window(ref window) => window.clone(),
             _Partition::SplitH(ref left, _) => left.borrow().first_window(),
             _Partition::SplitV(ref top, _) => top.borrow().first_window(),
+        }
+    }
+
+    /// Returns the rightmost, bottommost leaf in this partition
+    fn last_window(&self) -> Rc<RefCell<Window>> {
+        match self.content {
+            _Partition::Window(ref window) => window.clone(),
+            _Partition::SplitH(_, ref right) => right.borrow().last_window(),
+            _Partition::SplitV(_, ref bot) => bot.borrow().last_window(),
         }
     }
 
@@ -866,14 +942,14 @@ impl Partition {
             };
 
             let sibling_owned = Rc::try_unwrap(sibling)
-                .expect("Sibling was not unique reference")
+                .unwrap_or_else(|_| panic!("Sibling was not unique reference"))
                 .into_inner();
 
             sibling_owned.set_size(parent_w, parent_h);
 
             set_children_parent(&sibling_owned, parent_weak);
 
-            parent_b.content = sibling_owned.content;
+            unsafe { ptr::write(&mut parent_b.content, sibling_owned.content) };
 
             Some(parent.clone())
         } else {
@@ -927,9 +1003,24 @@ impl Partition {
     }
 }
 
+#[derive(Clone)]
+struct Prompt {
+    len: usize,
+    window: Rc<RefCell<Window>>,
+    subject_window: ActiveWindow,
+}
+
+impl Prompt {
+    fn input(&self) -> String {
+        let w = self.window.borrow();
+        let b = w.buffer.borrow();
+        b.to_string()[self.len..].to_string()
+    }
+}
+
 struct Minibuffer {
     w: u16,
-    window_stack: Vec<Window>,
+    prompt_stack: Vec<Prompt>,
     _echo: Option<String>,
 }
 
@@ -937,15 +1028,15 @@ impl Minibuffer {
     fn new(w: u16) -> Minibuffer {
         Minibuffer {
             w: w,
-            window_stack: Vec::new(),
+            prompt_stack: Vec::new(),
             _echo: None,
         }
     }
 
     fn set_width(&mut self, w: u16) {
         self.w = w;
-        for window in &mut self.window_stack {
-            window.set_size(w, 2);
+        for prompt in &mut self.prompt_stack {
+            prompt.window.borrow_mut().set_size(w, 2);
         }
     }
 
@@ -969,15 +1060,63 @@ impl Minibuffer {
         self._echo = None;
     }
 
-    fn render(&self) -> Vec<String> {
-        match (self._echo.clone(), self.window_stack.last()) {
-            (Some(s), _) => vec![pad_line(s, self.w)],
-            (None, Some(w)) => w.render_lines(),
-            (None, None) => vec![n_spaces(self.w as usize)],
+    /// Returns the created prompt window
+    fn push_new_prompt<F>(&mut self,
+                          subject: ActiveWindow,
+                          prompt_s: &str,
+                          callback: F)
+                          -> Rc<RefCell<Window>>
+        where for<'a, 'b> F: Fn(&'a mut TedTui, &'b str) + 'static
+    {
+        let mut buf = Buffer::new();
+        buf.lines[0].push_str(prompt_s);
+        buf.local_keymap.insert(&[Key::Char('\n')], Cmd::PromptSubmit(Rc::new(callback)));
+
+        let mut window = Window::new(self.w, 2, Rc::new(RefCell::new(buf)), Weak::new());
+        window.move_point_to_end_of_buffer();
+
+        let window_shared = Rc::new(RefCell::new(window));
+
+        let prompt = Prompt {
+            len: prompt_s.len(),
+            window: window_shared.clone(),
+            subject_window: subject,
+        };
+
+        self.prompt_stack.push(prompt);
+
+        window_shared
+    }
+
+    fn render(&self) -> String {
+        match (self._echo.clone(), self.prompt_stack.last()) {
+            (Some(s), _) => pad_line(s, self.w),
+            (None, Some(p)) => pad_line(p.window
+                                         .borrow()
+                                         .render_lines()
+                                         .first()
+                                         .cloned()
+                                         .unwrap_or(String::new()),
+                                        self.w),
+            (None, None) => n_spaces(self.w as usize),
         }
     }
 }
 
+#[derive(Clone)]
+enum ActiveWindow {
+    Prompt(Rc<RefCell<Window>>),
+    Window(Rc<RefCell<Window>>),
+}
+
+impl ActiveWindow {
+    fn window(&self) -> &Rc<RefCell<Window>> {
+        match *self {
+            ActiveWindow::Prompt(ref w) => &w,
+            ActiveWindow::Window(ref w) => &w,
+        }
+    }
+}
 
 /// A frame of windows into buffers
 struct Frame {
@@ -985,10 +1124,10 @@ struct Frame {
     w: u16,
     /// Height in terminal lines
     h: u16,
-    /// Windows into the buffers to show in this frame
+    /// Windows into the buffers to show in this frame, including the minibuffer window
     windows: Rc<RefCell<Partition>>,
     /// The index of the active window in `self.windows`
-    active_window: Rc<RefCell<Window>>,
+    active_window: ActiveWindow,
     minibuffer: Minibuffer,
 }
 
@@ -1000,11 +1139,11 @@ impl Frame {
             w: 0,
             h: 0,
             windows: windows,
-            active_window: window,
+            active_window: ActiveWindow::Window(window),
             minibuffer: Minibuffer::new(0),
         };
 
-        f.active_window.borrow_mut().is_active = true;
+        f.active_window.window().borrow_mut().is_active = true;
         f.update_term_size();
 
         f
@@ -1026,7 +1165,7 @@ impl Frame {
 
         if changed {
             self.resize(w, h);
-            self.active_window.borrow_mut().reposition_view();
+            self.active_window.window().borrow_mut().reposition_view();
         }
         changed
     }
@@ -1036,7 +1175,7 @@ impl Frame {
         let minibuffer_rendering = RenderingSection {
             x: 0,
             y: self.h - 1,
-            lines: self.minibuffer.render(),
+            lines: vec![self.minibuffer.render()],
         };
 
         rendering_sections.push(minibuffer_rendering);
@@ -1065,8 +1204,8 @@ impl TedTui {
 
         keymap.insert(&[Key::Ctrl('f')], Cmd::MoveH(1));
         keymap.insert(&[Key::Ctrl('b')], Cmd::MoveH(-1));
-        keymap.insert(&[Key::Ctrl('n')], Cmd::MoveV(-1));
-        keymap.insert(&[Key::Ctrl('p')], Cmd::MoveV(1));
+        keymap.insert(&[Key::Ctrl('n')], Cmd::MoveV(1));
+        keymap.insert(&[Key::Ctrl('p')], Cmd::MoveV(-1));
         keymap.insert(&[Key::Ctrl('d')], Cmd::DeleteForward);
         keymap.insert(&[Key::Delete], Cmd::DeleteForward);
         keymap.insert(&[Key::Ctrl('h')], Cmd::DeleteBackward);
@@ -1075,7 +1214,6 @@ impl TedTui {
         keymap.insert(&[Key::Char('\t')], Cmd::Tab);
         keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('s')], Cmd::Save);
         keymap.insert(&[Key::Alt('g')], Cmd::GoToLine);
-        keymap.insert(&[Key::Esc], Cmd::Exit);
         keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('c')], Cmd::Exit);
         keymap.insert(&[Key::Ctrl('x'), Key::Char('2')], Cmd::SplitV);
         keymap.insert(&[Key::Ctrl('x'), Key::Char('3')], Cmd::SplitH);
@@ -1088,22 +1226,14 @@ impl TedTui {
             buffers: buffers,
             global_keymap: keymap,
             frame: Frame::new(scratch),
-            term: stdout().into_raw_mode().unwrap(),
+            term: stdout().into_raw_mode().expect("Terminal failed to enter raw mode"),
             key_seq: Vec::new(),
             prev_rendering_sections: Vec::new(),
         }
     }
 
-    fn active_window(&self) -> Ref<Window> {
-        self.frame.active_window.borrow()
-    }
-
-    fn active_window_mut(&self) -> RefMut<Window> {
-        self.frame.active_window.borrow_mut()
-    }
-
-    fn active_buffer(&self) -> Rc<RefCell<Buffer>> {
-        self.active_window().buffer.clone()
+    fn active_window(&self) -> &Rc<RefCell<Window>> {
+        self.frame.active_window.window()
     }
 
     /// Switch to buffer `name` in the active view
@@ -1112,7 +1242,7 @@ impl TedTui {
                          .entry(name.to_string())
                          .or_insert(Rc::new(RefCell::new(Buffer::new())))
                          .clone();
-        self.active_window_mut().buffer = buffer;
+        self.active_window().borrow_mut().buffer = buffer;
     }
 
     fn open_file(&mut self, name: &str) {
@@ -1132,67 +1262,202 @@ impl TedTui {
         self.switch_to_buffer(name)
     }
 
-    fn split_h(&self) {
-        self.active_window_mut().split_h()
+    fn insert_char_at_point(&self, c: char) {
+        self.active_window().borrow_mut().insert_char_at_point(c)
     }
 
-    fn split_v(&mut self) {
-        self.active_window_mut().split_v()
+    fn move_point_h(&self, n: isize) -> MoveRes {
+        self.active_window().borrow_mut().move_point_h(n)
     }
 
-    fn select_other_window(&mut self, n: isize) {
-        let next_window = self.frame.active_window.borrow().other_window(n);
-        self.frame.active_window.borrow_mut().is_active = false;
-        next_window.borrow_mut().is_active = true;
-        self.frame.active_window = next_window;
+    fn move_point_v(&self, n: isize) -> MoveRes {
+        self.active_window().borrow_mut().move_point_v(n)
     }
 
-    fn delete_active_window(&mut self) {
-        let maybe_sibling = self.frame.active_window.borrow().delete();
+    fn delete_forward_at_point(&self) -> MoveRes {
+        self.active_window().borrow_mut().delete_forward_at_point()
+    }
 
-        if let Some(sibling) = maybe_sibling {
-            sibling.borrow_mut().is_active = true;
-            self.frame.active_window = sibling;
-        } else {
-            self.frame.minibuffer.echo("Can't delete root window")
+    fn delete_backward_at_point(&self) -> MoveRes {
+        self.active_window().borrow_mut().delete_backward_at_point()
+    }
+
+    fn insert_new_line(&self) {
+        self.active_window().borrow_mut().insert_new_line()
+    }
+
+    fn insert_tab(&self) {
+        self.active_window().borrow_mut().insert_tab()
+    }
+
+    fn save_file(&self) {
+        self.active_window().borrow_mut().save_file()
+    }
+
+    fn split_h(&mut self) {
+        match self.frame.active_window {
+            ActiveWindow::Window(ref w) => w.borrow_mut().split_h(),
+            ActiveWindow::Prompt(_) => self.message("Can't split minibuffer window"),
         }
     }
 
+    fn split_v(&mut self) {
+        match self.frame.active_window {
+            ActiveWindow::Window(ref w) => w.borrow_mut().split_v(),
+            ActiveWindow::Prompt(_) => self.message("Can't split minibuffer window"),
+        }
+    }
+
+    /// Select the `n`th window following or preceding the current window.
+    ///
+    /// The topmost prompt is included in the selection cycle
+    fn select_other_window(&mut self, n: isize) {
+        if n != 0 {
+            self.active_window().borrow_mut().is_active = false;
+
+            let (other_window, was_prompt) = match self.frame.active_window {
+                ActiveWindow::Window(ref w) => {
+                    let next_window = w.borrow().other_window(n);
+                    if (n > 0 && next_window.borrow().is_first_in_frame()) ||
+                       (n < 0 && next_window.borrow().is_last_in_frame()) {
+                        if let Some(prompt) = self.frame
+                                                  .minibuffer
+                                                  .prompt_stack
+                                                  .last()
+                                                  .map(|p| p.window.clone()) {
+                            (ActiveWindow::Prompt(prompt), false)
+                        } else {
+                            (ActiveWindow::Window(next_window.clone()), false)
+                        }
+                    } else {
+                        (ActiveWindow::Window(next_window), false)
+                    }
+                }
+                ActiveWindow::Prompt(_) => {
+                    if n > 0 {
+                        (ActiveWindow::Window(self.frame.windows.borrow().first_window()), true)
+                    } else {
+                        (ActiveWindow::Window(self.frame.windows.borrow().last_window()), true)
+                    }
+                }
+            };
+            self.frame.active_window = other_window;
+            self.active_window().borrow_mut().is_active = true;
+
+            if was_prompt {
+                self.select_other_window(n.signum() * (n.abs() - 1));
+            }
+        }
+    }
+
+    fn delete_active_window(&mut self) {
+        let new_active_window = match self.frame.active_window {
+            ActiveWindow::Prompt(_) => {
+                self.message("Can't delete minibuffer window");
+                return;
+            }
+            ActiveWindow::Window(ref window) => {
+                let maybe_sibling = window.borrow().delete();
+
+                if let Some(sibling) = maybe_sibling {
+                    sibling.borrow_mut().is_active = true;
+                    ActiveWindow::Window(sibling)
+                } else {
+                    self.frame.minibuffer.echo("Can't delete root window");
+                    return;
+                }
+            }
+        };
+        self.frame.active_window = new_active_window;
+    }
+
     fn delete_inactive_windows(&mut self) {
-        let active_window = self.frame.active_window.clone();
-        self.frame.windows = Partition::new_root_from_window(active_window);
-        self.frame.active_window.borrow_mut().set_size(self.frame.w, self.frame.h);
+        match self.frame.active_window {
+            ActiveWindow::Prompt(_) => self.message("Can't delete all ordinary windows"),
+            ActiveWindow::Window(ref window) => {
+                let active_window = window.clone();
+                self.frame.windows = Partition::new_root_from_window(active_window);
+                window.borrow_mut().set_size(self.frame.w, self.frame.h);
+            }
+        }
+    }
+
+    /// Prompt the user for input, then pass the parsed input to the given callback
+    fn prompt<F>(&mut self, p: &str, callback: F)
+        where F: Fn(&mut TedTui, &str) + 'static
+    {
+        let prompt_w =
+            self.frame.minibuffer.push_new_prompt(self.frame.active_window.clone(), p, callback);
+
+        self.frame.active_window = ActiveWindow::Prompt(prompt_w);
+    }
+
+
+    fn prompt_submit(&mut self, callback: &Fn(&mut TedTui, &str)) {
+        if let Some(prompt) = self.frame.minibuffer.prompt_stack.pop() {
+            let input = prompt.input();
+
+            self.frame.active_window = prompt.subject_window;
+
+            callback(self, &input)
+        } else {
+            self.message("No prompt to submit")
+        }
+    }
+
+    fn go_to_line(&mut self) {
+        self.prompt("Go to line: ", |ted, s| match s.parse::<isize>() {
+            Ok(n) => {
+                ted.frame.active_window.window().borrow_mut().move_point_to_line(n - 1);
+            }
+            Err(_) => ted.message("Please enter a number."),
+        })
+    }
+
+    fn cancel(&mut self) {
+        match self.frame.active_window {
+            ActiveWindow::Prompt(_) => {
+                self.select_other_window(1);
+
+                self.frame
+                    .minibuffer
+                    .prompt_stack
+                    .pop()
+                    .expect("Active prompt not in prompt stack");
+            }
+            _ => (),
+        }
+        self.message("Cancel");
     }
 
     /// Returns true if exit
-    fn eval(&mut self, cmd: &Cmd) -> bool {
+    fn eval(&mut self, cmd: Cmd) -> bool {
         let mut r = MoveRes::Ok;
-        match *cmd {
-            Cmd::Insert(c) => {
-                self.active_window_mut().insert_char_at_point(c);
-            }
-            Cmd::MoveH(n) => r = self.active_window_mut().move_point_h(n),
-            Cmd::MoveV(n) => r = self.active_window_mut().move_point_v(n),
-            Cmd::DeleteForward => r = self.active_window_mut().delete_forward_at_point(),
-            Cmd::DeleteBackward => r = self.active_window_mut().delete_backward_at_point(),
-            Cmd::Newline => self.active_window_mut().insert_new_line(),
-            Cmd::Tab => self.active_window_mut().insert_tab(),
+        match cmd {
+            Cmd::Insert(c) => self.insert_char_at_point(c),
+            Cmd::MoveH(n) => r = self.move_point_h(n),
+            Cmd::MoveV(n) => r = self.move_point_v(n),
+            Cmd::DeleteForward => r = self.delete_forward_at_point(),
+            Cmd::DeleteBackward => r = self.delete_backward_at_point(),
+            Cmd::Newline => self.insert_new_line(),
+            Cmd::Tab => self.insert_tab(),
             Cmd::Exit => return true,
-            Cmd::GoToLine => unimplemented!(),
-            Cmd::Save => self.active_window().save_file(),
+            Cmd::GoToLine => self.go_to_line(),
+            Cmd::Save => self.save_file(),
             Cmd::SplitH => self.split_h(),
             Cmd::SplitV => self.split_v(),
             Cmd::DeleteWindow => self.delete_active_window(),
             Cmd::DeleteOtherWindows => self.delete_inactive_windows(),
             Cmd::OtherWindow(n) => self.select_other_window(n),
-            Cmd::Cancel => self.message("Cancel"),
+            Cmd::PromptSubmit(callback) => self.prompt_submit(&*callback),
+            Cmd::Cancel => self.cancel(),
         }
         match r {
             MoveRes::Beg => self.message("Beginning of buffer"),
             MoveRes::End => self.message("End of buffer"),
             MoveRes::Ok => (),
         }
-        self.active_window_mut().reposition_view();
+        self.active_window().borrow_mut().reposition_view();
         false
     }
 
@@ -1225,7 +1490,7 @@ impl TedTui {
         self.key_seq.push(key);
 
         let maybe_cmd = {
-            let active_buffer = self.active_buffer();
+            let active_buffer = &self.frame.active_window.window().borrow().buffer;
             let active_buffer_b = active_buffer.borrow();
             let keymaps = [&active_buffer_b.local_keymap, &self.global_keymap];
 
@@ -1255,10 +1520,10 @@ impl TedTui {
                     self.message("Key sequence canceled");
                     false
                 } else {
-                    self.eval(&Cmd::Cancel)
+                    self.eval(Cmd::Cancel)
                 }
             }
-            Some(cmd) => self.eval(&cmd),
+            Some(cmd) => self.eval(cmd),
             None => {
                 let s = format!("Key {} is undefined", ted_key_seq_to_string(&self.key_seq));
                 self.message(s);
@@ -1294,10 +1559,15 @@ impl TedTui {
     }
 
     fn cursor_pos(&self) -> (u16, u16) {
-        let active = self.active_window();
+        let active = self.frame.active_window.window().borrow();
         let cursor_x_relative_window = (active.point.col_i - active.left) as u16;
         let cursor_y_relative_window = (active.point.line_i - active.top) as u16;
-        let (window_x_absolute, window_y_absolute) = active.pos_in_frame();
+
+        let (window_x_absolute, window_y_absolute) = match self.frame.active_window {
+            ActiveWindow::Prompt(_) => (0, self.frame.h - 1),
+            ActiveWindow::Window(_) => active.pos_in_frame(),
+        };
+
         (1 + window_x_absolute + cursor_x_relative_window,
          1 + window_y_absolute + cursor_y_relative_window)
     }
