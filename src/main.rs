@@ -146,6 +146,8 @@ enum Cmd {
     GoToLine,
     /// Save file
     Save,
+    OpenFile,
+    SwitchBuf,
     SplitH,
     SplitV,
     /// Delete the active window
@@ -531,6 +533,11 @@ impl Window {
         } else {
             self.insert_char_at_point('\t');
         }
+    }
+
+    fn switch_to_buffer(&mut self, buffer: Rc<RefCell<Buffer>>) {
+        self.buffer = buffer;
+        self.point = Point::new()
     }
 
     /// Position the view of the window such that the pointer is in view.
@@ -1204,6 +1211,8 @@ impl TedTui {
         keymap.insert(&[Key::Char('\n')], Cmd::Newline);
         keymap.insert(&[Key::Char('\t')], Cmd::Tab);
         keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('s')], Cmd::Save);
+        keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('f')], Cmd::OpenFile);
+        keymap.insert(&[Key::Ctrl('x'), Key::Char('b')], Cmd::SwitchBuf);
         keymap.insert(&[Key::Alt('g')], Cmd::GoToLine);
         keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('c')], Cmd::Exit);
         keymap.insert(&[Key::Ctrl('x'), Key::Char('2')], Cmd::SplitV);
@@ -1228,15 +1237,15 @@ impl TedTui {
     }
 
     /// Switch to buffer `name` in the active view
-    fn switch_to_buffer(&mut self, name: &str) {
+    fn switch_to_buffer_with_name(&mut self, name: &str) {
         let buffer = self.buffers
                          .entry(name.to_string())
                          .or_insert(Rc::new(RefCell::new(Buffer::new(name))))
                          .clone();
-        self.active_window().borrow_mut().buffer = buffer;
+        self.active_window().borrow_mut().switch_to_buffer(buffer)
     }
 
-    fn open_file(&mut self, name: &str) {
+    fn open_file_from_path(&mut self, name: &str) {
         let filepath = fs::canonicalize(name).expect("File does not exist");
         let reader = io::BufReader::new(fs::File::open(&filepath)
             .expect("File could not be opened"));
@@ -1245,12 +1254,15 @@ impl TedTui {
                                .collect::<Result<Vec<_>, _>>()
                                .expect("File contains invalid utf8 data and cannot be displayed");
 
-        let buffer = Rc::new(RefCell::new(Buffer::new_file_buffer(filepath)));
-        buffer.borrow_mut().lines =
+        let mut buffer = Buffer::new_file_buffer(filepath);
+        buffer.lines =
             if !file_lines.is_empty() { file_lines } else { vec![Line::new(String::new())] };
 
-        self.buffers.insert(name.to_string(), buffer);
-        self.switch_to_buffer(name)
+        let bufname = buffer.name.clone();
+        let buffer_shared = Rc::new(RefCell::new(buffer));
+
+        self.buffers.insert(bufname.clone(), buffer_shared);
+        self.switch_to_buffer_with_name(&bufname)
     }
 
     fn insert_char_at_point(&self, c: char) {
@@ -1317,6 +1329,15 @@ impl TedTui {
             Some(ref p) => self.save_file_to_path(p),
             None => self.prompt("Save file: ", |ted, s| ted.save_file_to_path(Path::new(&s))),
         }
+    }
+
+    fn open_file(&mut self) {
+        self.prompt("Open file: ", |ted, s| ted.open_file_from_path(s))
+    }
+
+    fn switch_buffer(&mut self) {
+        self.prompt("Switch to buffer: ",
+                    |ted, s| ted.switch_to_buffer_with_name(s))
     }
 
     fn split_h(&mut self) {
@@ -1469,6 +1490,8 @@ impl TedTui {
             Cmd::Exit => return true,
             Cmd::GoToLine => self.go_to_line(),
             Cmd::Save => self.save_file(),
+            Cmd::OpenFile => self.open_file(),
+            Cmd::SwitchBuf => self.switch_buffer(),
             Cmd::SplitH => self.split_h(),
             Cmd::SplitV => self.split_v(),
             Cmd::DeleteWindow => self.delete_active_window(),
@@ -1706,7 +1729,7 @@ fn start_tui(opt_filename: Option<&str>) {
     let mut ted = TedTui::new();
 
     if let Some(filename) = opt_filename {
-        ted.open_file(filename);
+        ted.open_file_from_path(filename);
     }
 
     write!(ted.term, "{}{}", *COLOR_BG, *COLOR_TEXT).expect("Failed to reset colors");
