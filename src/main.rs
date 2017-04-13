@@ -134,6 +134,10 @@ enum Cmd {
     MoveH(isize),
     /// Move point n characters vertically
     MoveV(isize),
+    /// Move point upward by near window height
+    PageUp,
+    /// Move point downward by near window height
+    PageDown,
     /// Delete a character forwards
     DeleteForward,
     /// Delete a character backwards
@@ -421,6 +425,26 @@ impl Window {
         let line_i = self.point.line_i as isize + n;
 
         self.move_point_to_line(line_i)
+    }
+
+    /// Move point upward or downward by near full window height
+    fn page_v(&mut self, up: bool) -> MoveRes {
+        let n = (self.h as f32 * 0.8).ceil() as isize;
+        self.move_point_v(n * if up { -1 } else { 1 })
+    }
+
+    /// Move point upward by near full window height
+    ///
+    /// Returns whether move was prevented by beginning of buffer
+    fn page_up(&mut self) -> MoveRes {
+        self.page_v(true)
+    }
+
+    /// Move point downward by near full window height
+    ///
+    /// Returns whether move was prevented by end of buffer
+    fn page_down(&mut self) -> MoveRes {
+        self.page_v(false)
     }
 
     /// Move point to the end of the line
@@ -1204,6 +1228,10 @@ impl TedTui {
         keymap.insert(&[Key::Ctrl('b')], Cmd::MoveH(-1));
         keymap.insert(&[Key::Ctrl('n')], Cmd::MoveV(1));
         keymap.insert(&[Key::Ctrl('p')], Cmd::MoveV(-1));
+        keymap.insert(&[Key::Alt('p')], Cmd::PageUp);
+        keymap.insert(&[Key::Esc, Key::Char('p')], Cmd::PageUp);
+        keymap.insert(&[Key::Alt('n')], Cmd::PageDown);
+        keymap.insert(&[Key::Esc, Key::Char('n')], Cmd::PageDown);
         keymap.insert(&[Key::Ctrl('d')], Cmd::DeleteForward);
         keymap.insert(&[Key::Delete], Cmd::DeleteForward);
         keymap.insert(&[Key::Ctrl('h')], Cmd::DeleteBackward);
@@ -1214,6 +1242,7 @@ impl TedTui {
         keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('f')], Cmd::OpenFile);
         keymap.insert(&[Key::Ctrl('x'), Key::Char('b')], Cmd::SwitchBuf);
         keymap.insert(&[Key::Alt('g')], Cmd::GoToLine);
+        keymap.insert(&[Key::Esc, Key::Char('g')], Cmd::GoToLine);
         keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('c')], Cmd::Exit);
         keymap.insert(&[Key::Ctrl('x'), Key::Char('2')], Cmd::SplitV);
         keymap.insert(&[Key::Ctrl('x'), Key::Char('3')], Cmd::SplitH);
@@ -1275,6 +1304,14 @@ impl TedTui {
 
     fn move_point_v(&self, n: isize) -> MoveRes {
         self.active_window().borrow_mut().move_point_v(n)
+    }
+
+    fn page_up(&self) -> MoveRes {
+        self.active_window().borrow_mut().page_up()
+    }
+
+    fn page_down(&self) -> MoveRes {
+        self.active_window().borrow_mut().page_down()
     }
 
     fn delete_forward_at_point(&self) -> MoveRes {
@@ -1483,6 +1520,8 @@ impl TedTui {
             Cmd::Insert(c) => self.insert_char_at_point(c),
             Cmd::MoveH(n) => r = self.move_point_h(n),
             Cmd::MoveV(n) => r = self.move_point_v(n),
+            Cmd::PageUp => r = self.page_up(),
+            Cmd::PageDown => r = self.page_down(),
             Cmd::DeleteForward => r = self.delete_forward_at_point(),
             Cmd::DeleteBackward => r = self.delete_backward_at_point(),
             Cmd::Newline => self.insert_new_line(),
@@ -1739,7 +1778,7 @@ fn start_tui(opt_filename: Option<&str>) {
     #[cfg(feature = "profiling")]
     PROFILER.lock().unwrap().start("./prof.profile").expect("Failed to start profiler");
 
-    for event in TuiEvents::with_update_period(Duration::from_millis(30)) {
+    for event in TuiEvents::with_update_period(Duration::from_millis(300)) {
         let exit = ted.handle_event(event);
         if exit {
             break;
