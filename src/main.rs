@@ -25,7 +25,7 @@ use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::io::{self, Write, stdout, stdin, Stdout, BufRead};
 use std::iter::{once, repeat};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 use termion::{color, cursor};
@@ -222,6 +222,7 @@ impl Line {
 /// Could be purely temporary data, which does not exist in storage until saved,
 /// or simply a normal file loaded to memory for editing
 struct Buffer {
+    name: String,
     lines: Vec<Line>,
     filepath: Option<PathBuf>,
     /// A buffer-local keymap that may override bindings in the global keymap
@@ -229,8 +230,9 @@ struct Buffer {
 }
 
 impl Buffer {
-    fn new() -> Self {
+    fn new<S: Into<String>>(name: S) -> Self {
         Buffer {
+            name: name.into(),
             lines: vec![Line::new(String::new())],
             filepath: None,
             local_keymap: Keymap::new(),
@@ -238,7 +240,12 @@ impl Buffer {
     }
 
     fn new_file_buffer(filepath: PathBuf) -> Self {
-        Buffer { filepath: Some(filepath), ..Buffer::new() }
+        let filename = filepath.file_name()
+                               .expect(&format!("No filename for filepath \"{}\"",
+                                                filepath.display()))
+                               .to_string_lossy()
+                               .to_string();
+        Buffer { filepath: Some(filepath), ..Buffer::new(filename) }
     }
 
     fn to_string(&self) -> String {
@@ -526,28 +533,6 @@ impl Window {
         }
     }
 
-    fn save_file(&self) {
-        fn write_lines_to_file(f: fs::File, lines: &[Line]) -> io::Result<()> {
-            let mut bw = io::BufWriter::new(f);
-
-            let (fst, rest) = lines.split_first().unwrap();
-
-            bw.write_all(fst.data.as_bytes())?;
-            for l in rest {
-                bw.write_all("\n".as_bytes()).and_then(|_| bw.write_all(l.data.as_bytes()))?;
-            }
-            Ok(())
-        }
-
-        let buffer = self.buffer.borrow();
-        match buffer.filepath {
-            Some(ref p) => fs::File::create(p)
-                .and_then(|f| write_lines_to_file(f, &buffer.lines))
-                .expect("Failed to write buffer to file"),
-            None => unimplemented!(),
-        }
-    }
-
     /// Position the view of the window such that the pointer is in view.
     fn reposition_view(&mut self) {
         let buf = self.buffer.borrow();
@@ -705,8 +690,14 @@ impl Window {
     }
 
     fn render_modeline(&self) -> String {
+        let buffer = self.buffer.borrow();
         let r = self.point.line_i as f32 / max(1, self.buffer.borrow().lines.len() - 1) as f32;
-        let s = format!(" {}%", (r * 100.0).round() as u8);
+        let s = format!(" {}  L{}:{}% C{}",
+                        buffer.name,
+                        self.point
+                            .line_i + 1,
+                        (r * 100.0).round() as u8,
+                        self.point.col_i);
         let bg = if self.is_active { &*COLOR_BG_MODELINE } else { &*COLOR_BG_MODELINE_INACTIVE };
         format!("{}{}{}", bg, pad_line(s, self.w), *COLOR_BG)
     }
@@ -1068,7 +1059,7 @@ impl Minibuffer {
                           -> Rc<RefCell<Window>>
         where for<'a, 'b> F: Fn(&'a mut TedTui, &'b str) + 'static
     {
-        let mut buf = Buffer::new();
+        let mut buf = Buffer::new("*minibuffer*");
         buf.lines[0].push_str(prompt_s);
         buf.local_keymap.insert(&[Key::Char('\n')], Cmd::PromptSubmit(Rc::new(callback)));
 
@@ -1196,12 +1187,12 @@ struct TedTui {
 impl TedTui {
     fn new() -> Self {
         let mut buffers = HashMap::new();
-        let scratch = Rc::new(RefCell::new(Buffer::new()));
-        buffers.insert("*scratch*".to_string(), scratch.clone());
+        let scratch = "*scratch*";
+        let scratch_buf = Rc::new(RefCell::new(Buffer::new(scratch)));
+        buffers.insert(scratch.to_string(), scratch_buf.clone());
 
         let mut keymap = Keymap::new();
         keymap.insert(&[Key::Ctrl('g')], Cmd::Cancel);
-
         keymap.insert(&[Key::Ctrl('f')], Cmd::MoveH(1));
         keymap.insert(&[Key::Ctrl('b')], Cmd::MoveH(-1));
         keymap.insert(&[Key::Ctrl('n')], Cmd::MoveV(1));
@@ -1225,7 +1216,7 @@ impl TedTui {
         TedTui {
             buffers: buffers,
             global_keymap: keymap,
-            frame: Frame::new(scratch),
+            frame: Frame::new(scratch_buf),
             term: stdout().into_raw_mode().expect("Terminal failed to enter raw mode"),
             key_seq: Vec::new(),
             prev_rendering_sections: Vec::new(),
@@ -1240,7 +1231,7 @@ impl TedTui {
     fn switch_to_buffer(&mut self, name: &str) {
         let buffer = self.buffers
                          .entry(name.to_string())
-                         .or_insert(Rc::new(RefCell::new(Buffer::new())))
+                         .or_insert(Rc::new(RefCell::new(Buffer::new(name))))
                          .clone();
         self.active_window().borrow_mut().buffer = buffer;
     }
@@ -1290,8 +1281,42 @@ impl TedTui {
         self.active_window().borrow_mut().insert_tab()
     }
 
-    fn save_file(&self) {
-        self.active_window().borrow_mut().save_file()
+    fn save_file_to_path(&mut self, filepath: &Path) {
+        fn write_lines_to_file(f: fs::File, lines: &[Line]) -> io::Result<()> {
+            let mut bw = io::BufWriter::new(f);
+
+            let (fst, rest) = lines.split_first().unwrap();
+
+            bw.write_all(fst.data.as_bytes())?;
+            for l in rest {
+                bw.write_all("\n".as_bytes()).and_then(|_| bw.write_all(l.data.as_bytes()))?;
+            }
+            Ok(())
+        }
+
+        let r = {
+            let window = self.active_window().borrow();
+            let buffer = window.buffer.borrow();
+
+            fs::File::create(filepath).and_then(|f| write_lines_to_file(f, &buffer.lines))
+        };
+        match r {
+            Ok(()) => self.message(format!("Saved to \"{}\"", filepath.display())),
+            Err(e) => self.message(format!("Error writing file \"{}\", {:?}",
+                                           filepath.display(),
+                                           e)),
+        }
+    }
+
+    fn save_file(&mut self) {
+        let window = self.active_window().clone();
+        let window_b = window.borrow();
+        let buffer = window_b.buffer.borrow();
+
+        match buffer.filepath {
+            Some(ref p) => self.save_file_to_path(p),
+            None => self.prompt("Save file: ", |ted, s| ted.save_file_to_path(Path::new(&s))),
+        }
     }
 
     fn split_h(&mut self) {
@@ -1463,9 +1488,10 @@ impl TedTui {
 
     /// Get the message buffer
     fn message_buffer_mut(&mut self) -> RefMut<Buffer> {
+        let messages = "*messages*";
         self.buffers
-            .entry("*messages*".to_string())
-            .or_insert(Rc::new(RefCell::new(Buffer::new())))
+            .entry(messages.to_string())
+            .or_insert(Rc::new(RefCell::new(Buffer::new(messages))))
             .borrow_mut()
     }
 
