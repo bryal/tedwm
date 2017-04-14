@@ -1,3 +1,5 @@
+#![feature(slice_patterns)]
+
 #[macro_use]
 extern crate clap;
 extern crate termion;
@@ -84,43 +86,47 @@ fn pad_line(mut s: String, len: u16) -> String {
     s
 }
 
-fn ted_key_to_string(k: Key) -> String {
-    match k {
-        Key::Ctrl(c) => format!("C-{}", c),
-        Key::Alt(c @ '\u{1}'...'\u{1F}') => format!("C-M-{}", (c as u8 - 1 + 'a' as u8) as char),
-        Key::Alt(c) => format!("M-{}", c),
-        Key::Char('\t') => format!("<tab>"),
-        Key::Char('\n') => format!("<return>"),
-        Key::Char(c) => format!("{}", c),
-        Key::F(n) => format!("<f{}>", n),
-        Key::Backspace => format!("<backspace>"),
-        Key::Delete => format!("<delete>"),
-        Key::Up => format!("<up>"),
-        Key::Down => format!("<down>"),
-        Key::Left => format!("<left>"),
-        Key::Right => format!("<right>"),
-        Key::Home => format!("<home>"),
-        Key::End => format!("<end>"),
-        Key::Insert => format!("<insert>"),
-        Key::PageDown => format!("<page down>"),
-        Key::PageUp => format!("<page down>"),
-        Key::Esc => format!("<escape>"),
-        Key::Null => format!("<null>"),
-        Key::__IsNotComplete => format!("UNSUPPORTED"),
-    }
-}
-
 /// Formatting of key events
 fn ted_key_seq_to_string(ks: &[Key]) -> String {
-    let (first, rest) = ks.split_first().expect("Key slice empty");
+    let (mut s, rest) = match *ks {
+        [] => panic!("Key seqyence empty"),
+        [Key::Char('\t'), ref rest..] => ("<tab>".to_string(), rest),
+        [Key::Char('\n'), ref rest..] => ("<return>".to_string(), rest),
+        [Key::Char(c @ '\u{1}'...'\u{1F}'), ref rest..] => {
+            (format!("C-{}", (c as u8 - 1 + 'a' as u8) as char), rest)
+        }
+        [Key::Char(c), ref rest..] => (format!("{}", c), rest),
+        [Key::Ctrl(c), ref rest..] => (format!("C-{}", c), rest),
+        [Key::Alt(c @ '\u{1}'...'\u{1F}'), ref rest..] => {
+            (format!("C-M-{}", (c as u8 - 1 + 'a' as u8) as char), rest)
+        }
+        [Key::Alt(c), ref rest..] => (format!("M-{}", c), rest),
+        [Key::F(n), ref rest..] => (format!("<f{}>", n), rest),
+        [Key::Backspace, ref rest..] => ("<backspace>".to_string(), rest),
+        [Key::Delete, ref rest..] => ("<delete>".to_string(), rest),
+        [Key::Up, ref rest..] => ("<up>".to_string(), rest),
+        [Key::Down, ref rest..] => ("<down>".to_string(), rest),
+        [Key::Left, ref rest..] => ("<left>".to_string(), rest),
+        [Key::Right, ref rest..] => ("<right>".to_string(), rest),
+        [Key::Home, ref rest..] => ("<home>".to_string(), rest),
+        [Key::End, ref rest..] => ("<end>".to_string(), rest),
+        [Key::Insert, ref rest..] => ("<insert>".to_string(), rest),
+        [Key::PageDown, ref rest..] => ("<page down>".to_string(), rest),
+        [Key::PageUp, ref rest..] => ("<page down>".to_string(), rest),
+        [Key::Esc, k @ Key::Char(_), ref rest..] |
+        [Key::Esc, k @ Key::Ctrl(_), ref rest..] => (format!("M-{}", ted_key_seq_to_string(&[k])),
+                                                     rest),
+        [Key::Esc, ref rest..] => ("<escape>".to_string(), rest),
+        [Key::Null, ref rest..] => ("<null>".to_string(), rest),
+        [Key::__IsNotComplete, ref rest..] => ("UNSUPPORTED".to_string(), rest),
+    };
 
-    let mut k_s = ted_key_to_string(first.clone());
-
-    for k in rest.iter().cloned() {
-        k_s.push(' ');
-        k_s.push_str(&ted_key_to_string(k))
+    if rest.len() > 0 {
+        s.push(' ');
+        s.push_str(&ted_key_seq_to_string(rest));
     }
-    k_s
+
+    s
 }
 
 /// A command to execute on e.g. a keypress
@@ -1206,6 +1212,22 @@ impl Frame {
     }
 }
 
+/// Binds the key sequence to a command in `keymap`.
+///
+/// Will remap all "M-FOO" sequences to "ESC FOO"
+fn bind_key(keymap: &mut Keymap, key_seq: &[Key], cmd: Cmd) -> Option<Cmd> {
+    let key_seq_remapped = key_seq.iter()
+                                  .flat_map(|key| match *key {
+                                      Key::Alt(c @ '\u{1}'...'\u{1F}') => {
+                                          vec![Key::Esc, Key::Ctrl((c as u8 | 0b11 << 6) as char)]
+                                      }
+                                      Key::Alt(c) => vec![Key::Esc, Key::Char(c)],
+                                      _ => vec![key.clone()],
+                                  })
+                                  .collect::<Vec<_>>();
+    keymap.insert(&key_seq_remapped, cmd)
+}
+
 struct TedTui {
     buffers: HashMap<String, Rc<RefCell<Buffer>>>,
     global_keymap: Keymap,
@@ -1223,33 +1245,37 @@ impl TedTui {
         buffers.insert(scratch.to_string(), scratch_buf.clone());
 
         let mut keymap = Keymap::new();
-        keymap.insert(&[Key::Ctrl('g')], Cmd::Cancel);
-        keymap.insert(&[Key::Ctrl('f')], Cmd::MoveH(1));
-        keymap.insert(&[Key::Ctrl('b')], Cmd::MoveH(-1));
-        keymap.insert(&[Key::Ctrl('n')], Cmd::MoveV(1));
-        keymap.insert(&[Key::Ctrl('p')], Cmd::MoveV(-1));
-        keymap.insert(&[Key::Alt('p')], Cmd::PageUp);
-        keymap.insert(&[Key::Esc, Key::Char('p')], Cmd::PageUp);
-        keymap.insert(&[Key::Alt('n')], Cmd::PageDown);
-        keymap.insert(&[Key::Esc, Key::Char('n')], Cmd::PageDown);
-        keymap.insert(&[Key::Ctrl('d')], Cmd::DeleteForward);
-        keymap.insert(&[Key::Delete], Cmd::DeleteForward);
-        keymap.insert(&[Key::Ctrl('h')], Cmd::DeleteBackward);
-        keymap.insert(&[Key::Backspace], Cmd::DeleteBackward);
-        keymap.insert(&[Key::Char('\n')], Cmd::Newline);
-        keymap.insert(&[Key::Char('\t')], Cmd::Tab);
-        keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('s')], Cmd::Save);
-        keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('f')], Cmd::OpenFile);
-        keymap.insert(&[Key::Ctrl('x'), Key::Char('b')], Cmd::SwitchBuf);
-        keymap.insert(&[Key::Alt('g')], Cmd::GoToLine);
-        keymap.insert(&[Key::Esc, Key::Char('g')], Cmd::GoToLine);
-        keymap.insert(&[Key::Ctrl('x'), Key::Ctrl('c')], Cmd::Exit);
-        keymap.insert(&[Key::Ctrl('x'), Key::Char('2')], Cmd::SplitV);
-        keymap.insert(&[Key::Ctrl('x'), Key::Char('3')], Cmd::SplitH);
-        keymap.insert(&[Key::Ctrl('x'), Key::Char('0')], Cmd::DeleteWindow);
-        keymap.insert(&[Key::Ctrl('x'), Key::Char('1')], Cmd::DeleteOtherWindows);
-        keymap.insert(&[Key::Ctrl('x'), Key::Char('o')], Cmd::OtherWindow(1));
-        keymap.insert(&[Key::Ctrl('x'), Key::Char('i')], Cmd::OtherWindow(-1));
+
+        let bindings = vec![(vec![Key::Ctrl('g')], Cmd::Cancel),
+                            (vec![Key::Ctrl('f')], Cmd::MoveH(1)),
+                            (vec![Key::Ctrl('b')], Cmd::MoveH(-1)),
+                            (vec![Key::Ctrl('n')], Cmd::MoveV(1)),
+                            (vec![Key::Ctrl('p')], Cmd::MoveV(-1)),
+                            (vec![Key::Alt('p')], Cmd::PageUp),
+                            (vec![Key::Alt('n')], Cmd::PageDown),
+                            (vec![Key::Ctrl('d')], Cmd::DeleteForward),
+                            (vec![Key::Delete], Cmd::DeleteForward),
+                            (vec![Key::Ctrl('h')], Cmd::DeleteBackward),
+                            (vec![Key::Backspace], Cmd::DeleteBackward),
+                            (vec![Key::Char('\n')], Cmd::Newline),
+                            (vec![Key::Char('\t')], Cmd::Tab),
+                            (vec![Key::Ctrl('x'), Key::Ctrl('s')], Cmd::Save),
+                            (vec![Key::Ctrl('x'), Key::Ctrl('f')], Cmd::OpenFile),
+                            (vec![Key::Ctrl('x'), Key::Char('b')], Cmd::SwitchBuf),
+                            (vec![Key::Alt('g')], Cmd::GoToLine),
+                            (vec![Key::Ctrl('x'), Key::Ctrl('c')], Cmd::Exit),
+                            (vec![Key::Ctrl('x'), Key::Char('2')], Cmd::SplitV),
+                            (vec![Key::Ctrl('x'), Key::Char('3')], Cmd::SplitH),
+                            (vec![Key::Ctrl('x'), Key::Char('0')], Cmd::DeleteWindow),
+                            (vec![Key::Ctrl('x'), Key::Char('1')], Cmd::DeleteOtherWindows),
+                            (vec![Key::Ctrl('x'), Key::Char('o')], Cmd::OtherWindow(1)),
+                            (vec![Key::Ctrl('x'), Key::Char('i')], Cmd::OtherWindow(-1))];
+
+        for (key_seq, cmd) in bindings {
+            if bind_key(&mut keymap, &key_seq, cmd).is_some() {
+                panic!("Duplicate default keybinding `{:?}`", key_seq)
+            }
+        }
 
         TedTui {
             buffers: buffers,
@@ -1565,7 +1591,7 @@ impl TedTui {
     }
 
     /// Returns whether to exit
-    fn handle_key_event(&mut self, key: Key) -> bool {
+    fn handle_key_event(&mut self, mut key: Key) -> bool {
         /// Keymaps sorted by priority
         fn keymaps_is_prefix(keymaps: &[&Keymap], key_seq: &[Key]) -> bool {
             keymaps.iter()
@@ -1575,7 +1601,14 @@ impl TedTui {
             keymaps.iter().filter_map(|keymap| keymap.get(key_seq)).next().cloned()
         }
 
-        self.key_seq.push(key);
+        // Remap any "M-FOO" to "ESC FOO"
+        if let Key::Alt(c) = key {
+            self.key_seq.push(Key::Esc);
+            self.key_seq.push(Key::Char(c));
+            key = Key::Char(c);
+        } else {
+            self.key_seq.push(key);
+        }
 
         let maybe_cmd = {
             let active_buffer = &self.frame.active_window.window().borrow().buffer;
@@ -1593,8 +1626,12 @@ impl TedTui {
                     .echo(&format!("{} ...", ted_key_seq_to_string(&self.key_seq)));
                 return false;
             } else if let Key::Char(c) = key {
-                self.key_seq.clear();
-                Some(Cmd::Insert(c))
+                if self.key_seq.len() == 1 {
+                    self.key_seq.clear();
+                    Some(Cmd::Insert(c))
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1666,12 +1703,11 @@ impl TedTui {
         write!(self.term, "{}", cursor::Hide)?;
 
         // Redraw modified sections
-        for (section, old_section) in
-            rendering_sections.iter()
-                              .zip(self.prev_rendering_sections
-                                       .iter()
-                                       .map(Some)
-                                       .chain(repeat(None))) {
+        for (section, old_section) in rendering_sections.iter()
+                                                        .zip(self.prev_rendering_sections
+                                                                 .iter()
+                                                                 .map(Some)
+                                                                 .chain(repeat(None))) {
             let (same_pos, same_len) = old_section.map(|os| {
                                                       ((os.x, os.y) == (section.x, section.y),
                                                        os.lines.len() == section.lines.len())
