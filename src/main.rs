@@ -22,7 +22,7 @@ use futures::{Sink, Stream};
 use futures::sync::mpsc::channel;
 use sequence_trie::SequenceTrie;
 use std::{str, thread, fs, mem, ptr};
-use std::cell::{RefCell, RefMut};
+use std::cell::{RefCell, Cell, RefMut};
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::io::{self, Write, stdout, stdin, Stdout, BufRead};
@@ -239,6 +239,8 @@ struct Buffer {
     filepath: Option<PathBuf>,
     /// A buffer-local keymap that may override bindings in the global keymap
     local_keymap: Keymap,
+    /// Whether the buffer has been modified since open or last save
+    modified: Cell<bool>,
 }
 
 impl Buffer {
@@ -248,6 +250,7 @@ impl Buffer {
             lines: vec![Line::new(String::new())],
             filepath: None,
             local_keymap: Keymap::new(),
+            modified: Cell::new(false),
         }
     }
 
@@ -325,6 +328,8 @@ impl Window {
 
             line.insert_str(self.point.col_byte_i, s);
         }
+
+        buffer.modified.set(true);
 
         self.point.col_byte_i += s.len();
         self.point.update_col_i(&buffer);
@@ -484,6 +489,8 @@ impl Window {
         self.point.prev_col_i = self.point.col_i;
 
         if self.point.col_byte_i < buffer.lines[self.point.line_i].data.len() {
+            buffer.modified.set(true);
+
             let line = &mut buffer.lines[self.point.line_i].data;
 
             let grapheme_len = line[self.point.col_byte_i..].graphemes(true).next().unwrap().len();
@@ -491,8 +498,11 @@ impl Window {
 
             line.drain(start..end);
 
+
             MoveRes::Ok
         } else if self.point.line_i < n_lines - 1 {
+            buffer.modified.set(true);
+
             let next_line = buffer.lines.remove(self.point.line_i + 1);
             buffer.lines[self.point.line_i].push_str(&next_line.data);
 
@@ -519,8 +529,12 @@ impl Window {
                     .unwrap();
 
                 line.data.drain(i..(i + len));
+
                 i
             };
+
+            buffer.modified.set(true);
+
             self.point.col_byte_i = i;
             self.point.update_col_i(&buffer);
             self.point.prev_col_i = self.point.col_i;
@@ -536,6 +550,8 @@ impl Window {
 
             buffer.lines[self.point.line_i].push_str(&line.data);
 
+            buffer.modified.set(true);
+
             MoveRes::Ok
         } else {
             self.point.prev_col_i = self.point.col_i;
@@ -548,6 +564,8 @@ impl Window {
         let rest = buffer.lines[self.point.line_i].data.split_off(self.point.col_byte_i);
 
         buffer.lines.insert(self.point.line_i + 1, Line::new(rest));
+
+        buffer.modified.set(true);
 
         self.point.line_i += 1;
         self.point.col_byte_i = 0;
@@ -729,7 +747,8 @@ impl Window {
     fn render_modeline(&self) -> String {
         let buffer = self.buffer.borrow();
         let r = self.point.line_i as f32 / max(1, self.buffer.borrow().lines.len() - 1) as f32;
-        let s = format!(" {}  L{}:{}% C{}",
+        let s = format!(" {} {}  L{}:{}% C{}",
+                        if buffer.modified.get() { "*" } else { "-" },
                         buffer.name,
                         self.point
                             .line_i + 1,
@@ -1373,7 +1392,12 @@ impl TedTui {
             let window = self.active_window().borrow();
             let buffer = window.buffer.borrow();
 
-            fs::File::create(filepath).and_then(|f| write_lines_to_file(f, &buffer.lines))
+            let r = fs::File::create(filepath).and_then(|f| write_lines_to_file(f, &buffer.lines));
+
+            if r.is_ok() {
+                buffer.modified.set(false)
+            }
+            r
         };
         match r {
             Ok(()) => self.message(format!("Saved to \"{}\"", filepath.display())),
