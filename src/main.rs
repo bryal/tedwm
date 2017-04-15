@@ -1,7 +1,8 @@
-#![feature(slice_patterns)]
+#![feature(slice_patterns, fnbox)]
 
 #[macro_use]
 extern crate clap;
+extern crate itertools;
 extern crate termion;
 extern crate unicode_width;
 extern crate unicode_segmentation;
@@ -10,21 +11,24 @@ extern crate tokio_timer;
 #[macro_use]
 extern crate lazy_static;
 extern crate sequence_trie;
-
 #[cfg(feature = "profiling")]
 extern crate cpuprofiler;
 
-use clap::{Arg, App};
+mod seq_set;
 
+use clap::{Arg, App};
 #[cfg(feature = "profiling")]
 use cpuprofiler::PROFILER;
 use futures::{Sink, Stream};
 use futures::sync::mpsc::channel;
+use itertools::Itertools;
+use seq_set::SequenceSet;
 use sequence_trie::SequenceTrie;
-use std::{str, thread, fs, mem, ptr};
-use std::cell::{RefCell, Cell, RefMut};
+use std::{str, thread, fs, mem, ptr, process};
+use std::boxed::FnBox;
+use std::cell::{RefCell, RefMut};
 use std::cmp::{max, min};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write, stdout, stdin, Stdout, BufRead};
 use std::iter::{once, repeat};
 use std::path::{Path, PathBuf};
@@ -166,8 +170,8 @@ enum Cmd {
     DeleteOtherWindows,
     /// Select the nth window following or preceding the active window cyclically
     OtherWindow(isize),
-    /// Submit the topmost prompt and send the input to the associated callback
-    PromptSubmit(Rc<Fn(&mut TedTui, &str)>),
+    /// Submit the topmost prompt by send the input to the associated callback
+    PromptSubmit,
     /// Cancel a multi-key stroke or prompting command
     Cancel,
 }
@@ -240,7 +244,7 @@ struct Buffer {
     /// A buffer-local keymap that may override bindings in the global keymap
     local_keymap: Keymap,
     /// Whether the buffer has been modified since open or last save
-    modified: Cell<bool>,
+    modified: bool,
 }
 
 impl Buffer {
@@ -250,7 +254,7 @@ impl Buffer {
             lines: vec![Line::new(String::new())],
             filepath: None,
             local_keymap: Keymap::new(),
-            modified: Cell::new(false),
+            modified: false,
         }
     }
 
@@ -273,6 +277,28 @@ impl Buffer {
                     .collect()
             })
             .unwrap_or(String::new())
+    }
+
+    fn save_to_path(&mut self, filepath: &Path) -> io::Result<()> {
+        fn write_lines_to_file(f: fs::File, lines: &[Line]) -> io::Result<()> {
+            let mut bw = io::BufWriter::new(f);
+
+            let (fst, rest) = lines.split_first().unwrap();
+
+            bw.write_all(fst.data.as_bytes())?;
+            for l in rest {
+                bw.write_all("\n".as_bytes()).and_then(|_| bw.write_all(l.data.as_bytes()))?;
+            }
+            Ok(())
+        }
+
+        let r = fs::File::create(filepath).and_then(|f| write_lines_to_file(f, &self.lines));
+
+        if r.is_ok() {
+            self.modified = false
+        }
+
+        r
     }
 }
 
@@ -329,7 +355,7 @@ impl Window {
             line.insert_str(self.point.col_byte_i, s);
         }
 
-        buffer.modified.set(true);
+        buffer.modified = true;
 
         self.point.col_byte_i += s.len();
         self.point.update_col_i(&buffer);
@@ -489,7 +515,7 @@ impl Window {
         self.point.prev_col_i = self.point.col_i;
 
         if self.point.col_byte_i < buffer.lines[self.point.line_i].data.len() {
-            buffer.modified.set(true);
+            buffer.modified = true;
 
             let line = &mut buffer.lines[self.point.line_i].data;
 
@@ -501,7 +527,7 @@ impl Window {
 
             MoveRes::Ok
         } else if self.point.line_i < n_lines - 1 {
-            buffer.modified.set(true);
+            buffer.modified = true;
 
             let next_line = buffer.lines.remove(self.point.line_i + 1);
             buffer.lines[self.point.line_i].push_str(&next_line.data);
@@ -533,7 +559,7 @@ impl Window {
                 i
             };
 
-            buffer.modified.set(true);
+            buffer.modified = true;
 
             self.point.col_byte_i = i;
             self.point.update_col_i(&buffer);
@@ -550,7 +576,7 @@ impl Window {
 
             buffer.lines[self.point.line_i].push_str(&line.data);
 
-            buffer.modified.set(true);
+            buffer.modified = true;
 
             MoveRes::Ok
         } else {
@@ -565,7 +591,7 @@ impl Window {
 
         buffer.lines.insert(self.point.line_i + 1, Line::new(rest));
 
-        buffer.modified.set(true);
+        buffer.modified = true;
 
         self.point.line_i += 1;
         self.point.col_byte_i = 0;
@@ -748,7 +774,7 @@ impl Window {
         let buffer = self.buffer.borrow();
         let r = self.point.line_i as f32 / max(1, self.buffer.borrow().lines.len() - 1) as f32;
         let s = format!(" {} {}  L{}:{}% C{}",
-                        if buffer.modified.get() { "*" } else { "-" },
+                        if buffer.modified { "*" } else { "-" },
                         buffer.name,
                         self.point
                             .line_i + 1,
@@ -1050,11 +1076,11 @@ impl Partition {
     }
 }
 
-#[derive(Clone)]
 struct Prompt {
     len: usize,
     window: Rc<RefCell<Window>>,
     subject_window: ActiveWindow,
+    callback: Box<for<'t, 'i> FnBox(&'t mut TedTui, &'i str)>
 }
 
 impl Prompt {
@@ -1108,16 +1134,15 @@ impl Minibuffer {
     }
 
     /// Returns the created prompt window
-    fn push_new_prompt<F>(&mut self,
+    fn push_new_prompt(&mut self,
                           subject: ActiveWindow,
                           prompt_s: &str,
-                          callback: F)
+                          callback: Box<FnBox(&mut TedTui, &str)>)
                           -> Rc<RefCell<Window>>
-        where for<'a, 'b> F: Fn(&'a mut TedTui, &'b str) + 'static
     {
         let mut buf = Buffer::new("*minibuffer*");
         buf.lines[0].push_str(prompt_s);
-        buf.local_keymap.insert(&[Key::Char('\n')], Cmd::PromptSubmit(Rc::new(callback)));
+        buf.local_keymap.insert(&[Key::Char('\n')], Cmd::PromptSubmit);
 
         let mut window = Window::new(self.w, 2, Rc::new(RefCell::new(buf)), Weak::new());
         window.move_point_to_end_of_buffer();
@@ -1128,6 +1153,7 @@ impl Minibuffer {
             len: prompt_s.len(),
             window: window_shared.clone(),
             subject_window: subject,
+            callback: callback,
         };
 
         self.prompt_stack.push(prompt);
@@ -1375,47 +1401,38 @@ impl TedTui {
         self.active_window().borrow_mut().insert_tab()
     }
 
-    fn save_file_to_path(&mut self, filepath: &Path) {
-        fn write_lines_to_file(f: fs::File, lines: &[Line]) -> io::Result<()> {
-            let mut bw = io::BufWriter::new(f);
-
-            let (fst, rest) = lines.split_first().unwrap();
-
-            bw.write_all(fst.data.as_bytes())?;
-            for l in rest {
-                bw.write_all("\n".as_bytes()).and_then(|_| bw.write_all(l.data.as_bytes()))?;
+    fn save_buffer(&mut self, buffer: Rc<RefCell<Buffer>>) {
+        fn handle_res(ted: &mut TedTui, res: io::Result<()>, filepath: &Path) {
+            match res {
+                Ok(()) => ted.message(format!("Saved to \"{}\"", filepath.display())),
+                Err(e) => ted.message(format!("Error writing file \"{}\", {:?}",
+                                              filepath.display(),
+                                              e)),
             }
-            Ok(())
         }
 
-        let r = {
-            let window = self.active_window().borrow();
-            let buffer = window.buffer.borrow();
+        let filepath = buffer.borrow().filepath.clone();
 
-            let r = fs::File::create(filepath).and_then(|f| write_lines_to_file(f, &buffer.lines));
-
-            if r.is_ok() {
-                buffer.modified.set(false)
+        match filepath {
+            Some(p) => {
+                let r = buffer.borrow_mut().save_to_path(&p);
+                handle_res(self, r, &p)
             }
-            r
-        };
-        match r {
-            Ok(()) => self.message(format!("Saved to \"{}\"", filepath.display())),
-            Err(e) => self.message(format!("Error writing file \"{}\", {:?}",
-                                           filepath.display(),
-                                           e)),
+            None => self.prompt("Save file: ", move |ted, s| {
+                let p = Path::new(&s);
+                let r = buffer.borrow_mut().save_to_path(p);
+                handle_res(ted, r, p)
+            }),
         }
     }
 
-    fn save_file(&mut self) {
-        let window = self.active_window().clone();
-        let window_b = window.borrow();
-        let buffer = window_b.buffer.borrow();
+    fn save_active_buffer(&mut self) {
+        let buffer = {
+            let window_b = self.active_window().borrow();
+            window_b.buffer.clone()
+        };
 
-        match buffer.filepath {
-            Some(ref p) => self.save_file_to_path(p),
-            None => self.prompt("Save file: ", |ted, s| ted.save_file_to_path(Path::new(&s))),
-        }
+        self.save_buffer(buffer)
     }
 
     fn open_file(&mut self) {
@@ -1517,22 +1534,22 @@ impl TedTui {
 
     /// Prompt the user for input, then pass the parsed input to the given callback
     fn prompt<F>(&mut self, p: &str, callback: F)
-        where F: Fn(&mut TedTui, &str) + 'static
+        where F: FnOnce(&mut TedTui, &str) + 'static
     {
         let prompt_w =
-            self.frame.minibuffer.push_new_prompt(self.frame.active_window.clone(), p, callback);
+            self.frame.minibuffer.push_new_prompt(self.frame.active_window.clone(), p, Box::new(callback));
 
         self.frame.active_window = ActiveWindow::Prompt(prompt_w);
     }
 
 
-    fn prompt_submit(&mut self, callback: &Fn(&mut TedTui, &str)) {
+    fn prompt_submit(&mut self) {
         if let Some(prompt) = self.frame.minibuffer.prompt_stack.pop() {
             let input = prompt.input();
 
             self.frame.active_window = prompt.subject_window;
-
-            callback(self, &input)
+            
+            FnBox::call_box(prompt.callback, (self, input.as_str()))
         } else {
             self.message("No prompt to submit")
         }
@@ -1564,7 +1581,7 @@ impl TedTui {
     }
 
     /// Returns true if exit
-    fn eval(&mut self, cmd: Cmd) -> bool {
+    fn eval(&mut self, cmd: Cmd) {
         let mut r = MoveRes::Ok;
         match cmd {
             Cmd::Insert(c) => self.insert_char_at_point(c),
@@ -1576,9 +1593,9 @@ impl TedTui {
             Cmd::DeleteBackward => r = self.delete_backward_at_point(),
             Cmd::Newline => self.insert_new_line(),
             Cmd::Tab => self.insert_tab(),
-            Cmd::Exit => return true,
+            Cmd::Exit => self.try_exit(HashSet::new()),
             Cmd::GoToLine => self.go_to_line(),
-            Cmd::Save => self.save_file(),
+            Cmd::Save => self.save_active_buffer(),
             Cmd::OpenFile => self.open_file(),
             Cmd::SwitchBuf => self.switch_buffer(),
             Cmd::SplitH => self.split_h(),
@@ -1586,7 +1603,7 @@ impl TedTui {
             Cmd::DeleteWindow => self.delete_active_window(),
             Cmd::DeleteOtherWindows => self.delete_inactive_windows(),
             Cmd::OtherWindow(n) => self.select_other_window(n),
-            Cmd::PromptSubmit(callback) => self.prompt_submit(&*callback),
+            Cmd::PromptSubmit => self.prompt_submit(),
             Cmd::Cancel => self.cancel(),
         }
         match r {
@@ -1595,7 +1612,6 @@ impl TedTui {
             MoveRes::Ok => (),
         }
         self.active_window().borrow_mut().reposition_view();
-        false
     }
 
     /// Get the message buffer
@@ -1614,8 +1630,7 @@ impl TedTui {
         self.message_buffer_mut().lines.push(Line::new(msg));
     }
 
-    /// Returns whether to exit
-    fn handle_key_event(&mut self, mut key: Key) -> bool {
+    fn handle_key_event(&mut self, mut key: Key) {
         /// Keymaps sorted by priority
         fn keymaps_is_prefix(keymaps: &[&Keymap], key_seq: &[Key]) -> bool {
             keymaps.iter()
@@ -1648,7 +1663,8 @@ impl TedTui {
                 self.frame
                     .minibuffer
                     .echo(&format!("{} ...", ted_key_seq_to_string(&self.key_seq)));
-                return false;
+
+                return;
             } else if let Key::Char(c) = key {
                 if self.key_seq.len() == 1 {
                     self.key_seq.clear();
@@ -1667,7 +1683,6 @@ impl TedTui {
                 if !self.key_seq.is_empty() {
                     self.key_seq.clear();
                     self.message("Key sequence canceled");
-                    false
                 } else {
                     self.eval(Cmd::Cancel)
                 }
@@ -1677,20 +1692,16 @@ impl TedTui {
                 let s = format!("Key {} is undefined", ted_key_seq_to_string(&self.key_seq));
                 self.message(s);
                 self.key_seq.clear();
-                false
             }
         }
     }
 
     /// Return whether to exit
-    fn handle_event(&mut self, event: TuiEvent) -> bool {
+    fn handle_event(&mut self, event: TuiEvent) {
         match event {
             TuiEvent::Key(k) => {
                 self.frame.minibuffer.clear_echo();
-                let exit = self.handle_key_event(k);
-                if exit {
-                    return true;
-                }
+                self.handle_key_event(k)
             }
             TuiEvent::Update => (),
             TuiEvent::Mouse(_) => {
@@ -1704,7 +1715,6 @@ impl TedTui {
         }
         self.frame.update_term_size();
         self.redraw();
-        false
     }
 
     fn cursor_pos(&self) -> (u16, u16) {
@@ -1765,6 +1775,63 @@ impl TedTui {
 
     fn redraw(&mut self) {
         self._redraw().expect("Redraw failed")
+    }
+
+    /// Clean up before exiting
+    ///
+    /// Returns whether exiting should continue. A return value of false
+    /// indicates that the user canceled the exit.
+    fn cleanup(&mut self, ignore_buffers: HashSet<String>) -> bool {
+        let buffers = self.buffers.values().cloned().collect::<Vec<_>>();
+        for buffer in buffers {
+            let (name, modified) = {
+                let b = buffer.borrow();
+                (b.name.clone(), b.modified)
+            };
+
+            if modified && !ignore_buffers.contains(&name) {
+                self.prompt(&format!("Buffer {} has been modified. Save? (yes, ignore, cancel) ",
+                                     name),
+                            move |ted, inp| {
+                    let mut decisions = SequenceSet::new();
+                    decisions.insert_str("yes");
+                    decisions.insert_str("ignore");
+                    decisions.insert_str("cancel");
+
+                    match decisions.contains_str(inp) {
+                        seq_set::StringEntry::Some(ref s) if s == "yes" => {
+                            ted.save_buffer(buffer);
+                            ted.try_exit(ignore_buffers)
+                        }
+                        seq_set::StringEntry::Some(ref s) if s == "ignore" =>
+                            ted.try_exit(once(name).collect()),
+                        seq_set::StringEntry::Some(ref s) if s == "cancel" => (),
+                        seq_set::StringEntry::Some(_) => unreachable!(),
+                        seq_set::StringEntry::NotUnique(matches) => {
+                            ted.message(format!("Multiple possible matches. {}",
+                                                matches.iter()
+                                                       .map(String::as_str)
+                                                       .intersperse(", ")
+                                                       .collect::<String>()));
+                            ted.try_exit(HashSet::new())
+                        },
+                        seq_set::StringEntry::None => {
+                            ted.message(format!("Undefined option \"{}\"", inp));
+                            ted.try_exit(HashSet::new())
+                        }
+                    }
+                });
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn try_exit(&mut self, ignore_buffers: HashSet<String>) {
+        if self.cleanup(ignore_buffers) {
+            process::exit(0)
+        }
     }
 }
 
@@ -1839,16 +1906,10 @@ fn start_tui(opt_filename: Option<&str>) {
     PROFILER.lock().unwrap().start("./prof.profile").expect("Failed to start profiler");
 
     for event in TuiEvents::with_update_period(Duration::from_millis(300)) {
-        let exit = ted.handle_event(event);
-        if exit {
-            break;
-        }
+        ted.handle_event(event);
     }
 
-    println_err!("Exiting...");
-
-    #[cfg(feature = "profiling")]
-    PROFILER.lock().unwrap().stop().expect("Failed to stop profiler");
+    panic!("No more events!")
 }
 
 fn main() {
