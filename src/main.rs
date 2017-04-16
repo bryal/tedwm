@@ -1,4 +1,4 @@
-#![feature(slice_patterns, fnbox)]
+#![feature(slice_patterns, fnbox, inclusive_range_syntax)]
 
 #[macro_use]
 extern crate clap;
@@ -27,7 +27,7 @@ use sequence_trie::SequenceTrie;
 use std::{str, thread, fs, mem, ptr, process};
 use std::boxed::FnBox;
 use std::cell::{RefCell, RefMut};
-use std::cmp::{max, min};
+use std::cmp::{max, min, Ord, Ordering};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write, stdout, stdin, Stdout, BufRead};
 use std::iter::{once, repeat};
@@ -43,7 +43,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 macro_rules! println_err {
     ($fmt:expr $(, $args:expr )*) => {
-        writeln!(io::stderr(), $fmt, $($args),*).expect("Failed to write to stderr")
+        write!(io::stderr(), "{}\n\r", format!($fmt, $($args),*)).expect("Failed to write to stderr")
     };
 }
 
@@ -61,6 +61,7 @@ const LINUM_WIDTH: usize = 6;
 lazy_static! {
     static ref COLOR_BG: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x18, 0x18, 0x10));
     static ref COLOR_TEXT: color::Fg<color::Rgb> = color::Fg(color::Rgb(0xF0, 0xE6, 0xD6));
+    static ref COLOR_BG_SELECTION: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x3A, 0x3A, 0x32));
     static ref COLOR_DIM_TEXT: color::Fg<color::Rgb> = color::Fg(color::Rgb(0x60, 0x56, 0x50));
     // At horizontal edges, mark a cell if line continues here on scroll
     static ref COLOR_BG_LINE_CONTINUES: color::Bg<color::Rgb> =
@@ -136,6 +137,8 @@ fn ted_key_seq_to_string(ks: &[Key]) -> String {
 /// A command to execute on e.g. a keypress
 #[derive(Clone)]
 enum Cmd {
+    /// Set the mark at point
+    SetMark,
     /// Insert a character into the buffer at point
     Insert(char),
     /// Insert a tab or spaces
@@ -154,8 +157,6 @@ enum Cmd {
     DeleteBackward,
     /// Insert a newline
     Newline,
-    /// Exit the program
-    Exit,
     /// Read a number from prompt and go to that line
     GoToLine,
     /// Save file
@@ -174,11 +175,13 @@ enum Cmd {
     PromptSubmit,
     /// Cancel a multi-key stroke or prompting command
     Cancel,
+    /// Exit the program
+    Exit,
 }
 
 type Keymap = SequenceTrie<Key, Cmd>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Point {
     /// 0-based index of, hopefully, column in terminal
     ///
@@ -213,6 +216,25 @@ impl Point {
     /// Update the column-position of the point in buffer `buffer`
     fn update_col_i(&mut self, buffer: &Buffer) {
         self.col_i = display_width(&buffer.lines[self.line_i].data[0..self.col_byte_i]);
+    }
+}
+
+impl Ord for Point {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.line_i > other.line_i ||
+           ((self.line_i == other.line_i) && self.col_i > other.col_i) {
+            Ordering::Greater
+        } else if (self.line_i == other.line_i) && (self.col_i > other.col_i) {
+            Ordering::Equal
+        } else {
+            Ordering::Less
+        }
+    }
+}
+
+impl PartialOrd for Point {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -324,6 +346,7 @@ struct Window {
     parent_partition: Weak<RefCell<Partition>>,
     buffer: Rc<RefCell<Buffer>>,
     point: Point,
+    mark: Option<Point>,
     /// Whether this is the active window
     is_active: bool,
 }
@@ -342,30 +365,13 @@ impl Window {
             parent_partition: parent,
             buffer: buffer,
             point: Point::new(),
+            mark: None,
             is_active: false,
         }
     }
 
-    /// Insert a string at point
-    fn insert_str_at_point(&mut self, s: &str) {
-        let mut buffer = self.buffer.borrow_mut();
-        {
-            let line = &mut buffer.lines[self.point.line_i];
-
-            line.insert_str(self.point.col_byte_i, s);
-        }
-
-        buffer.modified = true;
-
-        self.point.col_byte_i += s.len();
-        self.point.update_col_i(&buffer);
-        self.point.prev_col_i = self.point.col_i;
-    }
-
-    /// Insert a character at point
-    fn insert_char_at_point(&mut self, c: char) {
-        let mut s = [0; 4];
-        self.insert_str_at_point(c.encode_utf8(&mut s))
+    fn set_mark_at_point(&mut self) {
+        self.mark = Some(self.point)
     }
 
     /// Move point horizontally by `n` graphemes
@@ -502,6 +508,52 @@ impl Window {
         self.move_point_to_end_of_line()
     }
 
+    /// Insert a string at point
+    fn insert_str_at_point(&mut self, s: &str) {
+        let mut buffer = self.buffer.borrow_mut();
+        {
+            let line = &mut buffer.lines[self.point.line_i];
+
+            line.insert_str(self.point.col_byte_i, s);
+        }
+
+        buffer.modified = true;
+        self.mark = None;
+        self.point.col_byte_i += s.len();
+        self.point.update_col_i(&buffer);
+        self.point.prev_col_i = self.point.col_i;
+    }
+
+    /// Insert a character at point
+    fn insert_char_at_point(&mut self, c: char) {
+        let mut s = [0; 4];
+        self.insert_str_at_point(c.encode_utf8(&mut s))
+    }
+
+    fn insert_new_line(&mut self) {
+        let mut buffer = self.buffer.borrow_mut();
+        let rest = buffer.lines[self.point.line_i].data.split_off(self.point.col_byte_i);
+
+        buffer.lines.insert(self.point.line_i + 1, Line::new(rest));
+
+        buffer.modified = true;
+        self.mark = None;
+        self.point.line_i += 1;
+        self.point.col_byte_i = 0;
+        self.point.col_i = 0;
+        self.point.prev_col_i = 0;
+    }
+
+    /// Insert tab or spaces
+    fn insert_tab(&mut self) {
+        if TAB_INSERTS_SPACES {
+            let spaces = vec![' ' as u8; TAB_WIDTH];
+            self.insert_str_at_point(str::from_utf8(&spaces).unwrap());
+        } else {
+            self.insert_char_at_point('\t');
+        }
+    }
+
     // TODO: More generic deletion.
     //       Something like `delete-selection`
 
@@ -516,6 +568,7 @@ impl Window {
 
         if self.point.col_byte_i < buffer.lines[self.point.line_i].data.len() {
             buffer.modified = true;
+            self.mark = None;
 
             let line = &mut buffer.lines[self.point.line_i].data;
 
@@ -524,10 +577,10 @@ impl Window {
 
             line.drain(start..end);
 
-
             MoveRes::Ok
         } else if self.point.line_i < n_lines - 1 {
             buffer.modified = true;
+            self.mark = None;
 
             let next_line = buffer.lines.remove(self.point.line_i + 1);
             buffer.lines[self.point.line_i].push_str(&next_line.data);
@@ -559,11 +612,12 @@ impl Window {
                 i
             };
 
-            buffer.modified = true;
-
             self.point.col_byte_i = i;
             self.point.update_col_i(&buffer);
             self.point.prev_col_i = self.point.col_i;
+
+            buffer.modified = true;
+            self.mark = None;
 
             MoveRes::Ok
         } else if self.point.line_i > 0 {
@@ -577,6 +631,7 @@ impl Window {
             buffer.lines[self.point.line_i].push_str(&line.data);
 
             buffer.modified = true;
+            self.mark = None;
 
             MoveRes::Ok
         } else {
@@ -585,33 +640,14 @@ impl Window {
         }
     }
 
-    fn insert_new_line(&mut self) {
-        let mut buffer = self.buffer.borrow_mut();
-        let rest = buffer.lines[self.point.line_i].data.split_off(self.point.col_byte_i);
-
-        buffer.lines.insert(self.point.line_i + 1, Line::new(rest));
-
-        buffer.modified = true;
-
-        self.point.line_i += 1;
-        self.point.col_byte_i = 0;
-        self.point.col_i = 0;
-        self.point.prev_col_i = 0;
-    }
-
-    /// Insert tab or spaces
-    fn insert_tab(&mut self) {
-        if TAB_INSERTS_SPACES {
-            let spaces = vec![' ' as u8; TAB_WIDTH];
-            self.insert_str_at_point(str::from_utf8(&spaces).unwrap());
-        } else {
-            self.insert_char_at_point('\t');
-        }
-    }
-
     fn switch_to_buffer(&mut self, buffer: Rc<RefCell<Buffer>>) {
         self.buffer = buffer;
+        self.mark = None;
         self.point = Point::new()
+    }
+
+    fn cancel(&mut self) {
+        self.mark = None;
     }
 
     /// Position the view of the window such that the pointer is in view.
@@ -770,6 +806,44 @@ impl Window {
         }
     }
 
+    fn color_selection(&self, rendering_lines: &mut [String]) {
+        fn byte_index_of_col(col_i: usize, line: &str) -> usize {
+            let mut w = 0;
+            for (i, g) in line.grapheme_indices(true) {
+                if col_i == w {
+                    return i;
+                }
+                w += display_width(g);
+            }
+            line.len()
+        }
+
+        if let Some(mark) = self.mark {
+            let (start, end) = (min(self.point, mark), max(self.point, mark));
+
+            let (s_x, s_y) = (start.col_i - self.left, start.line_i - self.top);
+            let (e_x, e_y) = (end.col_i - self.left, end.line_i - self.top);
+
+            let (s_i, e_i) = (byte_index_of_col(s_x, &rendering_lines[s_y]),
+                                  byte_index_of_col(e_x, &rendering_lines[e_y]));
+
+            let bg_select_s = COLOR_BG_SELECTION.to_string();
+            let bg_select_len = bg_select_s.len();
+            let bg = COLOR_BG.to_string();
+
+            rendering_lines[s_y].insert_str(s_i, &bg_select_s);
+
+            for y in s_y..e_y {
+                let line_len = rendering_lines[y].len();
+                rendering_lines[y].insert_str(line_len, &bg);
+                
+                rendering_lines[y + 1].insert_str(0, &bg_select_s);
+            }
+
+            rendering_lines[e_y].insert_str(e_i + bg_select_len, &bg);
+        }
+    }
+
     fn render_modeline(&self) -> String {
         let buffer = self.buffer.borrow();
         let r = self.point.line_i as f32 / max(1, self.buffer.borrow().lines.len() - 1) as f32;
@@ -786,6 +860,7 @@ impl Window {
 
     fn render(&self) -> Vec<String> {
         let mut rendering_lines = self.render_lines();
+        self.color_selection(&mut rendering_lines);
         rendering_lines.push(self.render_modeline());
         rendering_lines
     }
@@ -1080,7 +1155,7 @@ struct Prompt {
     len: usize,
     window: Rc<RefCell<Window>>,
     subject_window: ActiveWindow,
-    callback: Box<for<'t, 'i> FnBox(&'t mut TedTui, &'i str)>
+    callback: Box<for<'t, 'i> FnBox(&'t mut TedTui, &'i str)>,
 }
 
 impl Prompt {
@@ -1135,11 +1210,10 @@ impl Minibuffer {
 
     /// Returns the created prompt window
     fn push_new_prompt(&mut self,
-                          subject: ActiveWindow,
-                          prompt_s: &str,
-                          callback: Box<FnBox(&mut TedTui, &str)>)
-                          -> Rc<RefCell<Window>>
-    {
+                       subject: ActiveWindow,
+                       prompt_s: &str,
+                       callback: Box<FnBox(&mut TedTui, &str)>)
+                       -> Rc<RefCell<Window>> {
         let mut buf = Buffer::new("*minibuffer*");
         buf.lines[0].push_str(prompt_s);
         buf.local_keymap.insert(&[Key::Char('\n')], Cmd::PromptSubmit);
@@ -1292,6 +1366,7 @@ impl TedTui {
         let mut keymap = Keymap::new();
 
         let bindings = vec![(vec![Key::Ctrl('g')], Cmd::Cancel),
+                            (vec![Key::Ctrl(' ')], Cmd::SetMark),
                             (vec![Key::Ctrl('f')], Cmd::MoveH(1)),
                             (vec![Key::Ctrl('b')], Cmd::MoveH(-1)),
                             (vec![Key::Ctrl('n')], Cmd::MoveV(1)),
@@ -1363,6 +1438,10 @@ impl TedTui {
 
         self.buffers.insert(bufname.clone(), buffer_shared);
         self.switch_to_buffer_with_name(&bufname)
+    }
+
+    fn set_mark_at_point(&self) {
+        self.active_window().borrow_mut().set_mark_at_point()
     }
 
     fn insert_char_at_point(&self, c: char) {
@@ -1536,8 +1615,9 @@ impl TedTui {
     fn prompt<F>(&mut self, p: &str, callback: F)
         where F: FnOnce(&mut TedTui, &str) + 'static
     {
-        let prompt_w =
-            self.frame.minibuffer.push_new_prompt(self.frame.active_window.clone(), p, Box::new(callback));
+        let prompt_w = self.frame.minibuffer.push_new_prompt(self.frame.active_window.clone(),
+                                                             p,
+                                                             Box::new(callback));
 
         self.frame.active_window = ActiveWindow::Prompt(prompt_w);
     }
@@ -1548,7 +1628,7 @@ impl TedTui {
             let input = prompt.input();
 
             self.frame.active_window = prompt.subject_window;
-            
+
             FnBox::call_box(prompt.callback, (self, input.as_str()))
         } else {
             self.message("No prompt to submit")
@@ -1575,7 +1655,7 @@ impl TedTui {
                     .pop()
                     .expect("Active prompt not in prompt stack");
             }
-            _ => (),
+            ActiveWindow::Window(ref w) => w.borrow_mut().cancel(),
         }
         self.message("Cancel");
     }
@@ -1584,6 +1664,7 @@ impl TedTui {
     fn eval(&mut self, cmd: Cmd) {
         let mut r = MoveRes::Ok;
         match cmd {
+            Cmd::SetMark => self.set_mark_at_point(),
             Cmd::Insert(c) => self.insert_char_at_point(c),
             Cmd::MoveH(n) => r = self.move_point_h(n),
             Cmd::MoveV(n) => r = self.move_point_v(n),
@@ -1640,13 +1721,20 @@ impl TedTui {
             keymaps.iter().filter_map(|keymap| keymap.get(key_seq)).next().cloned()
         }
 
-        // Remap any "M-FOO" to "ESC FOO"
-        if let Key::Alt(c) = key {
-            self.key_seq.push(Key::Esc);
-            self.key_seq.push(Key::Char(c));
-            key = Key::Char(c);
-        } else {
-            self.key_seq.push(key);
+        // Remap any "M-FOO" to "ESC FOO" and "<null>" to "C-<space>"
+        match key {
+            Key::Alt(c) => {
+                key = Key::Char(c);
+                self.key_seq.push(Key::Esc);
+                self.key_seq.push(key);
+            }
+            Key::Null => {
+                key = Key::Ctrl(' ');
+                self.key_seq.push(key);
+            }
+            _ => {
+                self.key_seq.push(key);
+            }
         }
 
         let maybe_cmd = {
@@ -1803,8 +1891,9 @@ impl TedTui {
                             ted.save_buffer(buffer);
                             ted.try_exit(ignore_buffers)
                         }
-                        seq_set::StringEntry::Some(ref s) if s == "ignore" =>
-                            ted.try_exit(once(name).collect()),
+                        seq_set::StringEntry::Some(ref s) if s == "ignore" => {
+                            ted.try_exit(once(name).collect())
+                        }
                         seq_set::StringEntry::Some(ref s) if s == "cancel" => (),
                         seq_set::StringEntry::Some(_) => unreachable!(),
                         seq_set::StringEntry::NotUnique(matches) => {
@@ -1814,7 +1903,7 @@ impl TedTui {
                                                        .intersperse(", ")
                                                        .collect::<String>()));
                             ted.try_exit(HashSet::new())
-                        },
+                        }
                         seq_set::StringEntry::None => {
                             ted.message(format!("Undefined option \"{}\"", inp));
                             ted.try_exit(HashSet::new())
