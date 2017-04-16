@@ -43,7 +43,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 macro_rules! println_err {
     ($fmt:expr $(, $args:expr )*) => {
-        write!(io::stderr(), "{}\n\r", format!($fmt, $($args),*)).expect("Failed to write to stderr")
+        write!(io::stderr(), "{}\n\r", format!($fmt, $($args),*))
+            .expect("Failed to write to stderr")
     };
 }
 
@@ -69,6 +70,11 @@ lazy_static! {
     static ref COLOR_BG_MODELINE: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x4B, 0x4B, 0x40));
     static ref COLOR_BG_MODELINE_INACTIVE: color::Bg<color::Rgb> =
         color::Bg(color::Rgb(0x29, 0x29, 0x22));
+}
+
+fn modulo(lhs: isize, rhs: usize) -> usize {
+    let rhs = rhs as isize;
+    (((lhs % rhs) + rhs) % rhs) as usize
 }
 
 /// The width in columns of a string if it is displayed in a terminal.
@@ -151,10 +157,17 @@ enum Cmd {
     PageUp,
     /// Move point downward by near window height
     PageDown,
-    /// Delete a character forwards
-    DeleteForward,
-    /// Delete a character backwards
-    DeleteBackward,
+    /// Delete characters forward (positive) or backward (negative)
+    DeleteCharsH(isize),
+    /// Copy selection and add to clipboard
+    Copy,
+    /// Cut selection and add to clipboard
+    Cut,
+    /// Paste latest entry in clipboard
+    Paste,
+    /// Cycles the active entry to paste of the clipboard forward (newer, positive)
+    /// or backward (older, negative).
+    CycleClipring(isize),
     /// Insert a newline
     Newline,
     /// Read a number from prompt and go to that line
@@ -215,7 +228,7 @@ impl Point {
 
     /// Update the column-position of the point in buffer `buffer`
     fn update_col_i(&mut self, buffer: &Buffer) {
-        self.col_i = display_width(&buffer.lines[self.line_i].data[0..self.col_byte_i]);
+        self.col_i = display_width(&buffer.lines[self.line_i][0..self.col_byte_i]);
     }
 }
 
@@ -238,30 +251,12 @@ impl PartialOrd for Point {
     }
 }
 
-struct Line {
-    data: String,
-}
-
-impl Line {
-    fn new(s: String) -> Line {
-        Line { data: s }
-    }
-
-    fn insert_str(&mut self, i: usize, s: &str) {
-        self.data.insert_str(i, s);
-    }
-
-    fn push_str(&mut self, s: &str) {
-        self.data.push_str(s);
-    }
-}
-
 /// A buffer is a equivalent to a temporary file in memory.
 /// Could be purely temporary data, which does not exist in storage until saved,
 /// or simply a normal file loaded to memory for editing
 struct Buffer {
     name: String,
-    lines: Vec<Line>,
+    lines: Vec<String>,
     filepath: Option<PathBuf>,
     /// A buffer-local keymap that may override bindings in the global keymap
     local_keymap: Keymap,
@@ -273,7 +268,7 @@ impl Buffer {
     fn new<S: Into<String>>(name: S) -> Self {
         Buffer {
             name: name.into(),
-            lines: vec![Line::new(String::new())],
+            lines: vec![String::new()],
             filepath: None,
             local_keymap: Keymap::new(),
             modified: false,
@@ -290,26 +285,18 @@ impl Buffer {
     }
 
     fn to_string(&self) -> String {
-        self.lines
-            .split_last()
-            .map(|(last, init)| {
-                init.iter()
-                    .flat_map(|l| once(l.data.as_str()).chain(once("\n")))
-                    .chain(once(last.data.as_str()))
-                    .collect()
-            })
-            .unwrap_or(String::new())
+        self.lines.iter().map(String::as_str).intersperse("\n").collect()
     }
 
     fn save_to_path(&mut self, filepath: &Path) -> io::Result<()> {
-        fn write_lines_to_file(f: fs::File, lines: &[Line]) -> io::Result<()> {
+        fn write_lines_to_file(f: fs::File, lines: &[String]) -> io::Result<()> {
             let mut bw = io::BufWriter::new(f);
 
             let (fst, rest) = lines.split_first().unwrap();
 
-            bw.write_all(fst.data.as_bytes())?;
+            bw.write_all(fst.as_bytes())?;
             for l in rest {
-                bw.write_all("\n".as_bytes()).and_then(|_| bw.write_all(l.data.as_bytes()))?;
+                bw.write_all("\n".as_bytes()).and_then(|_| bw.write_all(l.as_bytes()))?;
             }
             Ok(())
         }
@@ -321,6 +308,60 @@ impl Buffer {
         }
 
         r
+    }
+
+    fn copy_selection(&mut self,
+                      (start_x, start_y): (usize, usize),
+                      (end_x, end_y): (usize, usize))
+                      -> Vec<String> {
+        if start_y == end_y {
+            vec![self.lines[start_y][start_x..end_x].to_string()]
+        } else {
+            let mut lines = Vec::new();
+            lines.push(self.lines[start_y][start_x..].to_string());
+            lines.extend(self.lines[(start_y + 1)..end_y].to_vec());
+            lines.push(self.lines[end_y][0..end_x].to_string());
+
+            let (prec, succ) = self.lines.split_at_mut(start_y + 1);
+            prec[start_y].push_str(&succ[0]);
+
+            lines
+        }
+    }
+
+    fn cut_selection(&mut self,
+                     (start_x, start_y): (usize, usize),
+                     (end_x, end_y): (usize, usize))
+                     -> Vec<String> {
+        if start_y == end_y {
+            vec![self.lines[start_y].drain(start_x..end_x).collect()]
+        } else {
+            let mut lines = Vec::new();
+            lines.push(self.lines[start_y].drain(start_x..).collect());
+            lines.extend(self.lines.drain((start_y + 1)..end_y));
+            lines.push(self.lines[start_y + 1].drain(0..end_x).collect());
+
+            let last_rest = self.lines.remove(start_y + 1);
+            self.lines[start_y].push_str(&last_rest);
+
+            lines
+        }
+    }
+
+    fn paste(&mut self, x: usize, y: usize, lines: &[String]) {
+        if let Some((last, init)) = lines.split_last() {
+            if let Some((first, mids)) = init.split_first() {
+                let rest_of_line = self.lines[y].split_off(x);
+                let last_insert_line = last.to_string() + &rest_of_line;
+
+                let succ = self.lines.drain((y + 1)..).collect::<Vec<_>>();
+
+                self.lines[y].push_str(first);
+                self.lines.extend(mids.iter().cloned().chain(once(last_insert_line)).chain(succ));
+            } else {
+                self.lines[y].insert_str(x, last)
+            }
+        }
     }
 }
 
@@ -389,12 +430,12 @@ impl Window {
             let grapheme_byte_is = if forward {
                 let offset = self.point.col_byte_i;
 
-                Box::new(line.data[self.point.col_byte_i..]
+                Box::new(line[self.point.col_byte_i..]
                     .grapheme_indices(true)
                     .map(move |(i, _)| i + offset)
-                    .chain(once(line.data.len()))) as Box<Iterator<Item = _>>
+                    .chain(once(line.len()))) as Box<Iterator<Item = _>>
             } else {
-                Box::new(line.data[0..self.point.col_byte_i]
+                Box::new(line[0..self.point.col_byte_i]
                     .grapheme_indices(true)
                     .map(|(i, _)| i)
                     .chain(once(self.point.col_byte_i))
@@ -425,7 +466,7 @@ impl Window {
                 }
                 self.point.line_i -= 1;
                 line = &buffer.lines[self.point.line_i];
-                self.point.col_byte_i = line.data.len();
+                self.point.col_byte_i = line.len();
             }
         }
     }
@@ -446,7 +487,7 @@ impl Window {
             MoveRes::Ok
         };
 
-        let line = &buffer.lines[self.point.line_i].data;
+        let line = &buffer.lines[self.point.line_i];
         self.point.col_i = 0;
         self.point.col_byte_i = 0;
         for (i, g) in line.grapheme_indices(true) {
@@ -493,7 +534,7 @@ impl Window {
     /// Move point to the end of the line
     fn move_point_to_end_of_line(&mut self) {
         let buffer = self.buffer.borrow();
-        let line = &buffer.lines[self.point.line_i].data;
+        let line = &buffer.lines[self.point.line_i];
         self.point.col_byte_i = line.len();
         self.point.update_col_i(&buffer)
     }
@@ -532,9 +573,9 @@ impl Window {
 
     fn insert_new_line(&mut self) {
         let mut buffer = self.buffer.borrow_mut();
-        let rest = buffer.lines[self.point.line_i].data.split_off(self.point.col_byte_i);
+        let rest = buffer.lines[self.point.line_i].split_off(self.point.col_byte_i);
 
-        buffer.lines.insert(self.point.line_i + 1, Line::new(rest));
+        buffer.lines.insert(self.point.line_i + 1, rest);
 
         buffer.modified = true;
         self.mark = None;
@@ -554,90 +595,54 @@ impl Window {
         }
     }
 
-    // TODO: More generic deletion.
-    //       Something like `delete-selection`
-
-    /// Delete the grapheme infront of the cursor
-    ///
-    /// Returns whether deletion was prevented by end of buffer
-    fn delete_forward_at_point(&mut self) -> MoveRes {
-        let mut buffer = self.buffer.borrow_mut();
-        let n_lines = buffer.lines.len();
-
-        self.point.prev_col_i = self.point.col_i;
-
-        if self.point.col_byte_i < buffer.lines[self.point.line_i].data.len() {
-            buffer.modified = true;
+    /// Copy text between mark and point. Return `None` if mark is not set
+    fn copy_selection(&mut self) -> Option<Vec<String>> {
+        self.mark.map(|mark| {
+            let (start, end) = (min(self.point, mark), max(self.point, mark));
+            let lines = self.buffer.borrow_mut().copy_selection((start.col_byte_i, start.line_i),
+                                                                (end.col_byte_i, end.line_i));
             self.mark = None;
-
-            let line = &mut buffer.lines[self.point.line_i].data;
-
-            let grapheme_len = line[self.point.col_byte_i..].graphemes(true).next().unwrap().len();
-            let (start, end) = (self.point.col_byte_i, self.point.col_byte_i + grapheme_len);
-
-            line.drain(start..end);
-
-            MoveRes::Ok
-        } else if self.point.line_i < n_lines - 1 {
-            buffer.modified = true;
-            self.mark = None;
-
-            let next_line = buffer.lines.remove(self.point.line_i + 1);
-            buffer.lines[self.point.line_i].push_str(&next_line.data);
-
-            MoveRes::Ok
-        } else {
-            MoveRes::End
-        }
+            lines
+        })
     }
 
-    /// Delete the grapheme right behind the cursor
-    ///
-    /// Returns whether deletion was prevented by beginning of buffer
-    fn delete_backward_at_point(&mut self) -> MoveRes {
+    /// Cut text between mark and point. Return `None` if mark is not set
+    fn cut_selection(&mut self) -> Option<Vec<String>> {
+        self.mark.map(|mark| {
+            let (start, end) = (min(self.point, mark), max(self.point, mark));
+            let lines = self.buffer.borrow_mut().cut_selection((start.col_byte_i, start.line_i),
+                                                               (end.col_byte_i, end.line_i));
+            self.mark = None;
+            self.point = start;
+            lines
+        })
+    }
+
+    /// Paste `lines` into associated buffer
+    fn paste(&mut self, lines: &[String]) {
         let mut buffer = self.buffer.borrow_mut();
 
-        if self.point.col_i > 0 {
-            let i = {
-                let line = &mut buffer.lines[self.point.line_i];
-                let (i, len) = line.data[0..self.point.col_byte_i]
-                    .grapheme_indices(true)
-                    .rev()
-                    .next()
-                    .map(|(i, g)| (i, g.len()))
-                    .unwrap();
+        buffer.paste(self.point.col_byte_i, self.point.line_i, lines);
 
-                line.data.drain(i..(i + len));
-
-                i
-            };
-
-            self.point.col_byte_i = i;
-            self.point.update_col_i(&buffer);
-            self.point.prev_col_i = self.point.col_i;
-
-            buffer.modified = true;
-            self.mark = None;
-
-            MoveRes::Ok
-        } else if self.point.line_i > 0 {
-            let line = buffer.lines.remove(self.point.line_i);
-
-            self.point.col_byte_i = buffer.lines[self.point.line_i - 1].data.len();
-            self.point.line_i -= 1;
-            self.point.update_col_i(&buffer);
-            self.point.prev_col_i = self.point.col_i;
-
-            buffer.lines[self.point.line_i].push_str(&line.data);
-
-            buffer.modified = true;
-            self.mark = None;
-
-            MoveRes::Ok
+        let last = lines.last().expect("No lines to paste");
+        self.point.line_i += lines.len() - 1;
+        if lines.len() > 1 {
+            self.point.col_byte_i = last.len();
         } else {
-            self.point.prev_col_i = self.point.col_i;
-            MoveRes::Beg
+            self.point.col_byte_i += last.len()
         }
+
+        self.point.update_col_i(&buffer)
+    }
+
+    /// Delete `n` characters forward (positive) or backward (negative) at point
+    ///
+    /// Returns whether deletion was prevented by end of buffer
+    fn delete_chars_h(&mut self, n: isize) -> MoveRes {
+        self.set_mark_at_point();
+        let move_res = self.move_point_h(n);
+        self.cut_selection();
+        move_res
     }
 
     fn switch_to_buffer(&mut self, buffer: Rc<RefCell<Buffer>>) {
@@ -673,7 +678,7 @@ impl Window {
         let rightmost_col = buf.lines[self.top..]
             .iter()
             .take(self.h as usize)
-            .map(|l| display_width(&l.data))
+            .map(|l| display_width(&l))
             .max()
             .unwrap_or(0);
 
@@ -798,7 +803,7 @@ impl Window {
         } else {
             buffer.lines[self.top..]
                 .iter()
-                .map(|l| h_cols(&l.data, self.left, self.w))
+                .map(|l| h_cols(&l, self.left, self.w))
                 .map(|l| pad_line(l.clone(), self.w))
                 .chain(repeat(n_spaces(self.w as usize)))
                 .take(self.h as usize - 1)
@@ -821,11 +826,18 @@ impl Window {
         if let Some(mark) = self.mark {
             let (start, end) = (min(self.point, mark), max(self.point, mark));
 
-            let (s_x, s_y) = (start.col_i - self.left, start.line_i - self.top);
-            let (e_x, e_y) = (end.col_i - self.left, end.line_i - self.top);
+            let (s_x, s_y) = {
+                let s_y = start.line_i as isize - self.top as isize;
+                if s_y < 0 { (0, 0) } else { (start.col_i - self.left, s_y as usize) }
+            };
+            let (e_x, e_y) = if end.line_i > self.top + (self.h - 2) as usize {
+                (self.w as usize, self.h as usize - 2)
+            } else {
+                (end.col_i - self.left, end.line_i - self.top)
+            };
 
             let (s_i, e_i) = (byte_index_of_col(s_x, &rendering_lines[s_y]),
-                                  byte_index_of_col(e_x, &rendering_lines[e_y]));
+                              byte_index_of_col(e_x, &rendering_lines[e_y]));
 
             let bg_select_s = COLOR_BG_SELECTION.to_string();
             let bg_select_len = bg_select_s.len();
@@ -836,7 +848,7 @@ impl Window {
             for y in s_y..e_y {
                 let line_len = rendering_lines[y].len();
                 rendering_lines[y].insert_str(line_len, &bg);
-                
+
                 rendering_lines[y + 1].insert_str(0, &bg_select_s);
             }
 
@@ -1347,6 +1359,28 @@ fn bind_key(keymap: &mut Keymap, key_seq: &[Key], cmd: Cmd) -> Option<Cmd> {
     keymap.insert(&key_seq_remapped, cmd)
 }
 
+struct Clipring {
+    entries: Vec<Vec<String>>,
+    active: usize,
+}
+
+impl Clipring {
+    fn get(&self) -> Option<&[String]> {
+        self.entries.get(self.active).map(|v| v.as_slice())
+    }
+
+    fn push(&mut self, e: Vec<String>) {
+        self.entries.push(e);
+        self.active = self.entries.len() - 1
+    }
+
+    fn cycle(&mut self, n: isize) {
+        if !self.entries.is_empty() {
+            self.active = modulo(self.active as isize + n, self.entries.len());
+        }
+    }
+}
+
 struct TedTui {
     buffers: HashMap<String, Rc<RefCell<Buffer>>>,
     global_keymap: Keymap,
@@ -1354,6 +1388,7 @@ struct TedTui {
     term: RawTerminal<Stdout>,
     key_seq: Vec<Key>,
     prev_rendering_sections: Vec<RenderingSection>,
+    clipring: Clipring,
 }
 
 impl TedTui {
@@ -1373,10 +1408,15 @@ impl TedTui {
                             (vec![Key::Ctrl('p')], Cmd::MoveV(-1)),
                             (vec![Key::Alt('p')], Cmd::PageUp),
                             (vec![Key::Alt('n')], Cmd::PageDown),
-                            (vec![Key::Ctrl('d')], Cmd::DeleteForward),
-                            (vec![Key::Delete], Cmd::DeleteForward),
-                            (vec![Key::Ctrl('h')], Cmd::DeleteBackward),
-                            (vec![Key::Backspace], Cmd::DeleteBackward),
+                            (vec![Key::Ctrl('d')], Cmd::DeleteCharsH(1)),
+                            (vec![Key::Delete], Cmd::DeleteCharsH(1)),
+                            (vec![Key::Ctrl('h')], Cmd::DeleteCharsH(-1)),
+                            (vec![Key::Backspace], Cmd::DeleteCharsH(-1)),
+                            (vec![Key::Ctrl('w')], Cmd::Cut),
+                            (vec![Key::Alt('w')], Cmd::Copy),
+                            (vec![Key::Ctrl('y')], Cmd::Paste),
+                            (vec![Key::Alt('y')], Cmd::CycleClipring(-1)),
+                            (vec![Key::Alt('Y')], Cmd::CycleClipring(1)),
                             (vec![Key::Char('\n')], Cmd::Newline),
                             (vec![Key::Char('\t')], Cmd::Tab),
                             (vec![Key::Ctrl('x'), Key::Ctrl('s')], Cmd::Save),
@@ -1404,6 +1444,7 @@ impl TedTui {
             term: stdout().into_raw_mode().expect("Terminal failed to enter raw mode"),
             key_seq: Vec::new(),
             prev_rendering_sections: Vec::new(),
+            clipring: Clipring { entries: Vec::new(), active: 0 },
         }
     }
 
@@ -1425,13 +1466,12 @@ impl TedTui {
         let reader = io::BufReader::new(fs::File::open(&filepath)
             .expect("File could not be opened"));
         let file_lines = reader.lines()
-                               .map(|result| result.map(|s| Line::new(s)))
+                               .map(|result| result)
                                .collect::<Result<Vec<_>, _>>()
                                .expect("File contains invalid utf8 data and cannot be displayed");
 
         let mut buffer = Buffer::new_file_buffer(filepath);
-        buffer.lines =
-            if !file_lines.is_empty() { file_lines } else { vec![Line::new(String::new())] };
+        buffer.lines = if !file_lines.is_empty() { file_lines } else { vec![String::new()] };
 
         let bufname = buffer.name.clone();
         let buffer_shared = Rc::new(RefCell::new(buffer));
@@ -1464,12 +1504,52 @@ impl TedTui {
         self.active_window().borrow_mut().page_down()
     }
 
-    fn delete_forward_at_point(&self) -> MoveRes {
-        self.active_window().borrow_mut().delete_forward_at_point()
+    fn delete_chars_h(&self, n: isize) -> MoveRes {
+        self.active_window().borrow_mut().delete_chars_h(n)
     }
 
-    fn delete_backward_at_point(&self) -> MoveRes {
-        self.active_window().borrow_mut().delete_backward_at_point()
+    fn copy_selection(&mut self) {
+        let r = {
+            let mut window = self.active_window().borrow_mut();
+            window.copy_selection()
+        };
+        if let Some(sel) = r {
+            self.clipring.push(sel)
+        }
+    }
+
+    fn cut_selection(&mut self) {
+        let r = {
+            let mut window = self.active_window().borrow_mut();
+            window.cut_selection()
+        };
+        if let Some(sel) = r {
+            self.clipring.push(sel)
+        }
+    }
+
+    fn paste(&mut self) {
+        if self.clipring.get().is_some() {
+            self.active_window().borrow_mut().paste(self.clipring.get().unwrap())
+        } else {
+            self.message("Clipring is empty")
+        }
+    }
+
+    fn cycle_clipring(&mut self, n: isize) {
+        self.clipring.cycle(n);
+        if self.clipring.get().is_some() {
+            self.frame.minibuffer.echo(&format!("{:?}",
+                                                self.clipring
+                                                    .get()
+                                                    .unwrap()
+                                                    .iter()
+                                                    .map(String::as_str)
+                                                    .intersperse("\n")
+                                                    .collect::<String>()))
+        } else {
+            self.message("Clipring is empty")
+        }
     }
 
     fn insert_new_line(&self) {
@@ -1670,8 +1750,11 @@ impl TedTui {
             Cmd::MoveV(n) => r = self.move_point_v(n),
             Cmd::PageUp => r = self.page_up(),
             Cmd::PageDown => r = self.page_down(),
-            Cmd::DeleteForward => r = self.delete_forward_at_point(),
-            Cmd::DeleteBackward => r = self.delete_backward_at_point(),
+            Cmd::DeleteCharsH(n) => r = self.delete_chars_h(n),
+            Cmd::Copy => self.copy_selection(),
+            Cmd::Cut => self.cut_selection(),
+            Cmd::Paste => self.paste(),
+            Cmd::CycleClipring(n) => self.cycle_clipring(n),
             Cmd::Newline => self.insert_new_line(),
             Cmd::Tab => self.insert_tab(),
             Cmd::Exit => self.try_exit(HashSet::new()),
@@ -1708,7 +1791,7 @@ impl TedTui {
     fn message<S: Into<String>>(&mut self, msg: S) {
         let msg = msg.into();
         self.frame.minibuffer.echo(&msg);
-        self.message_buffer_mut().lines.push(Line::new(msg));
+        self.message_buffer_mut().lines.push(msg);
     }
 
     fn handle_key_event(&mut self, mut key: Key) {
@@ -1825,11 +1908,12 @@ impl TedTui {
         write!(self.term, "{}", cursor::Hide)?;
 
         // Redraw modified sections
-        for (section, old_section) in rendering_sections.iter()
-                                                        .zip(self.prev_rendering_sections
-                                                                 .iter()
-                                                                 .map(Some)
-                                                                 .chain(repeat(None))) {
+        for (section, old_section) in
+            rendering_sections.iter()
+                              .zip(self.prev_rendering_sections
+                                       .iter()
+                                       .map(Some)
+                                       .chain(repeat(None))) {
             let (same_pos, same_len) = old_section.map(|os| {
                                                       ((os.x, os.y) == (section.x, section.y),
                                                        os.lines.len() == section.lines.len())
