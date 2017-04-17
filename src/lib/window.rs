@@ -289,6 +289,66 @@ impl Window {
         self.move_point_to_end_of_line()
     }
 
+    /// Returns whether the search succeded
+    pub fn search_forward(&mut self, query: &str) -> bool {
+        let buffer = self.buffer.clone();
+        let buffer_b = buffer.borrow();
+        let lines = buffer_b.lines();
+
+        let search_line_is = once((self.point.col_byte_i, self.point.line_i))
+            .chain(((self.point.line_i + 1)..lines.len())
+                .chain(0..self.point.line_i)
+                .map(|y| (0, y)));
+
+        for (x_offset, y) in search_line_is {
+            let line = &lines[y];
+            if let Some(i) = line[x_offset..].find(query).map(|i| i + x_offset) {
+                self.point.line_i = y;
+                self.point.col_byte_i = i;
+                self.point.update_col_i(&buffer_b);
+                self.set_mark_at_point();
+                self.point.col_byte_i += query.len();
+                self.point.update_col_i(&buffer_b);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns whether the search succeded
+    pub fn search_backward(&mut self, query: &str) -> bool {
+        let buffer = self.buffer.clone();
+        let buffer_b = buffer.borrow();
+        let lines = buffer_b.lines();
+
+        let same_line = if self.point.col_byte_i > 0 {
+            Some((Some(self.point.col_byte_i - 1), self.point.line_i))
+        } else {
+            None
+        };
+
+        let search_line_is = same_line.into_iter()
+                                      .chain((0..self.point.line_i)
+                                          .rev()
+                                          .chain(((self.point.line_i + 1)..lines.len()).rev())
+                                          .map(|y| (None, y)));
+
+        for (lim, y) in search_line_is {
+            let line = &lines[y];
+            let lim = lim.unwrap_or(line.len());
+            if let Some(i) = line[0..lim].rfind(query) {
+                self.point.line_i = y;
+                self.point.col_byte_i = i;
+                self.point.update_col_i(&buffer_b);
+                self.set_mark_at_point();
+                self.point.col_byte_i += query.len();
+                self.point.update_col_i(&buffer_b);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Insert a string at point
     pub fn insert_str_at_point(&mut self, s: &str) {
         let mut buffer = self.buffer.borrow_mut();

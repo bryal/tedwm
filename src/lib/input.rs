@@ -67,6 +67,10 @@ pub enum Cmd {
     PageUp,
     /// Move point downward by near window height
     PageDown,
+    /// Do incremental search forward
+    SearchForward,
+    /// Do incremental search backward
+    SearchBackward,
     /// Delete characters forward (positive) or backward (negative)
     DeleteCharsH(isize),
     /// Copy selection and add to clipboard

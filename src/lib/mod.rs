@@ -12,7 +12,7 @@ use unicode_segmentation::UnicodeSegmentation;
 lazy_static! {
     pub static ref COLOR_BG: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x18, 0x18, 0x10));
     pub static ref COLOR_TEXT: color::Fg<color::Rgb> = color::Fg(color::Rgb(0xF0, 0xE6, 0xD6));
-    pub static ref COLOR_BG_SELECTION: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x3A, 0x3A, 0x32));
+    pub static ref COLOR_BG_SELECTION: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x80, 0x00, 0x38));
     pub static ref COLOR_DIM_TEXT: color::Fg<color::Rgb> = color::Fg(color::Rgb(0x60, 0x56, 0x50));
     pub static ref COLOR_BG_MODELINE: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x4B, 0x4B, 0x40));
     pub static ref COLOR_BG_MODELINE_INACTIVE: color::Bg<color::Rgb> =
@@ -24,9 +24,9 @@ pub const SCROLL_MARGIN_V: f32 = 0.3;
 /// Horizontal scroll margin as a normalized percentage of window width
 pub const SCROLL_MARGIN_H: f32 = 0.02;
 /// Whether to insert spaces on TAB press
-pub const TAB_INSERTS_SPACES: bool = false;
+pub const TAB_INSERTS_SPACES: bool = true;
 /// Tab display width / n.o. spaces to convert to
-pub const TAB_WIDTH: usize = 8;
+pub const TAB_WIDTH: usize = 4;
 
 /// The width in columns of a string if it is displayed in a terminal.
 ///

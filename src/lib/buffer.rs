@@ -1,4 +1,3 @@
-
 use itertools::Itertools;
 use lib::input::Keymap;
 use std::fs;
@@ -121,10 +120,6 @@ impl Buffer {
             lines.push(self.lines[start_y][start_x..].to_string());
             lines.extend(self.lines[(start_y + 1)..end_y].to_vec());
             lines.push(self.lines[end_y][0..end_x].to_string());
-
-            let (prec, succ) = self.lines.split_at_mut(start_y + 1);
-            prec[start_y].push_str(&succ[0]);
-
             lines
         }
     }

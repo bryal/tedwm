@@ -420,10 +420,12 @@ impl Minibuffer {
     pub fn push_new_prompt(&mut self,
                            subject: ActiveWindow,
                            prompt_s: &str,
+                           default: &str,
                            callback: Box<FnBox(&mut Tui, &str)>)
                            -> Rc<RefCell<Window>> {
         let mut buf = Buffer::new("*minibuffer*");
         buf.insert_str(0, 0, prompt_s);
+        buf.insert_str(prompt_s.len(), 0, default);
         buf.local_keymap.insert(&[Key::Char('\n')], Cmd::PromptSubmit);
 
         let mut window = Window::new(self.w, 2, Rc::new(RefCell::new(buf)), Weak::new());

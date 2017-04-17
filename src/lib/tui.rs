@@ -69,8 +69,14 @@ impl Tui {
                             (vec![Key::Ctrl('b')], Cmd::MoveH(-1)),
                             (vec![Key::Ctrl('n')], Cmd::MoveV(1)),
                             (vec![Key::Ctrl('p')], Cmd::MoveV(-1)),
+                            (vec![Key::Right], Cmd::MoveH(1)),
+                            (vec![Key::Left], Cmd::MoveH(-1)),
+                            (vec![Key::Down], Cmd::MoveV(1)),
+                            (vec![Key::Up], Cmd::MoveV(-1)),
                             (vec![Key::Alt('p')], Cmd::PageUp),
                             (vec![Key::Alt('n')], Cmd::PageDown),
+                            (vec![Key::Ctrl('s')], Cmd::SearchForward),
+                            (vec![Key::Ctrl('r')], Cmd::SearchBackward),
                             (vec![Key::Ctrl('d')], Cmd::DeleteCharsH(1)),
                             (vec![Key::Delete], Cmd::DeleteCharsH(1)),
                             (vec![Key::Ctrl('h')], Cmd::DeleteCharsH(-1)),
@@ -135,15 +141,18 @@ impl Tui {
     }
 
     fn open_file_from_path(&mut self, name: &str) {
-        let filepath = fs::canonicalize(name).expect("File does not exist");
+        match fs::canonicalize(name) {
+            Ok(filepath) => {
+                let buffer = Buffer::from_file(filepath);
+                let name = buffer.name().to_string();
 
-        let buffer = Buffer::from_file(filepath);
-        let name = buffer.name().to_string();
+                let buffer_shared = Rc::new(RefCell::new(buffer));
 
-        let buffer_shared = Rc::new(RefCell::new(buffer));
-
-        self.buffers.insert(name.clone(), buffer_shared);
-        self.switch_to_buffer_with_name(&name)
+                self.buffers.insert(name.clone(), buffer_shared);
+                self.switch_to_buffer_with_name(&name)
+            }
+            Err(e) => self.message(format!("Error opening file: {}", e)),
+        }
     }
 
     fn set_mark_at_point(&self) {
@@ -168,6 +177,34 @@ impl Tui {
 
     fn page_down(&self) -> MoveRes {
         self.active_window().borrow_mut().page_down()
+    }
+
+    fn search_forward_open_prompt(&mut self, default: &str) {
+        match self.frame.active_window.clone() {
+            ActiveWindow::Window(_) => self.prompt("Search: ", default, move |ted, query| {
+                if ted.active_window().borrow_mut().search_forward(query) {
+                    ted.active_window().borrow_mut().reposition_view();
+                    ted.search_forward_open_prompt(query)                   
+                } else {
+                    ted.message("Search failed")
+                }
+            }),
+            ActiveWindow::Prompt(_) => self.message("Can't search in minibuffer"),
+        }
+    }
+
+    fn search_backward_open_prompt(&mut self, default: &str) {
+        match self.frame.active_window.clone() {
+            ActiveWindow::Window(_) => self.prompt("Search backward: ", default, move |ted, query| {
+                if ted.active_window().borrow_mut().search_backward(query) {
+                    ted.active_window().borrow_mut().reposition_view();
+                    ted.search_backward_open_prompt(query)                   
+                } else {
+                    ted.message("Search failed")
+                }
+            }),
+            ActiveWindow::Prompt(_) => self.message("Can't search in minibuffer"),
+        }
     }
 
     fn delete_chars_h(&self, n: isize) -> MoveRes {
@@ -243,7 +280,7 @@ impl Tui {
                 let r = buffer.borrow_mut().save_to_path(&p);
                 handle_res(self, r, &p)
             }
-            None => self.prompt("Save file: ", move |ted, s| {
+            None => self.prompt("Save file: ", "", move |ted, s| {
                 let p = Path::new(&s);
                 let r = buffer.borrow_mut().save_to_path(p);
                 handle_res(ted, r, p)
@@ -261,11 +298,11 @@ impl Tui {
     }
 
     fn open_file(&mut self) {
-        self.prompt("Open file: ", |ted, s| ted.open_file_from_path(s))
+        self.prompt("Open file: ", "", |ted, s| ted.open_file_from_path(s))
     }
 
     fn switch_buffer(&mut self) {
-        self.prompt("Switch to buffer: ",
+        self.prompt("Switch to buffer: ", "",
                     |ted, s| ted.switch_to_buffer_with_name(s))
     }
 
@@ -361,11 +398,12 @@ impl Tui {
     }
 
     /// Prompt the user for input, then pass the parsed input to the given callback
-    fn prompt<F>(&mut self, p: &str, callback: F)
+    fn prompt<F>(&mut self, prompt: &str, default: &str,  callback: F)
         where F: FnOnce(&mut Tui, &str) + 'static
     {
         let prompt_w = self.frame.minibuffer.push_new_prompt(self.frame.active_window.clone(),
-                                                             p,
+                                                             prompt,
+                                                             default,
                                                              Box::new(callback));
 
         self.frame.active_window = ActiveWindow::Prompt(prompt_w);
@@ -385,7 +423,7 @@ impl Tui {
     }
 
     fn go_to_line(&mut self) {
-        self.prompt("Go to line: ", |ted, s| match s.parse::<isize>() {
+        self.prompt("Go to line: ", "", |ted, s| match s.parse::<isize>() {
             Ok(n) => {
                 ted.frame.active_window.window().borrow_mut().move_point_to_line(n - 1);
             }
@@ -419,6 +457,8 @@ impl Tui {
             Cmd::MoveV(n) => r = self.move_point_v(n),
             Cmd::PageUp => r = self.page_up(),
             Cmd::PageDown => r = self.page_down(),
+            Cmd::SearchForward => self.search_forward_open_prompt(""),
+            Cmd::SearchBackward => self.search_backward_open_prompt(""),
             Cmd::DeleteCharsH(n) => r = self.delete_chars_h(n),
             Cmd::Copy => self.copy_selection(),
             Cmd::Cut => self.cut_selection(),
@@ -637,6 +677,7 @@ impl Tui {
             if modified && !ignore_buffers.contains(&name) {
                 self.prompt(&format!("Buffer {} has been modified. Save? (yes, ignore, cancel) ",
                                      name),
+                            "",
                             move |ted, inp| {
                     let mut decisions = SequenceSet::new();
                     decisions.insert_str("yes");
