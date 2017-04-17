@@ -1953,7 +1953,7 @@ impl TedTui {
     ///
     /// Returns whether exiting should continue. A return value of false
     /// indicates that the user canceled the exit.
-    fn cleanup(&mut self, ignore_buffers: HashSet<String>) -> bool {
+    fn cleanup(&mut self, mut ignore_buffers: HashSet<String>) -> bool {
         let buffers = self.buffers.values().cloned().collect::<Vec<_>>();
         for buffer in buffers {
             let (name, modified) = {
@@ -1976,7 +1976,8 @@ impl TedTui {
                             ted.try_exit(ignore_buffers)
                         }
                         seq_set::StringEntry::Some(ref s) if s == "ignore" => {
-                            ted.try_exit(once(name).collect())
+                            ignore_buffers.insert(name);
+                            ted.try_exit(ignore_buffers)
                         }
                         seq_set::StringEntry::Some(ref s) if s == "cancel" => (),
                         seq_set::StringEntry::Some(_) => unreachable!(),
@@ -2003,6 +2004,7 @@ impl TedTui {
 
     fn try_exit(&mut self, ignore_buffers: HashSet<String>) {
         if self.cleanup(ignore_buffers) {
+            write!(self.term, "{}", termion::clear::All).ok();
             process::exit(0)
         }
     }
