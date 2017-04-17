@@ -333,6 +333,7 @@ impl Buffer {
                      (start_x, start_y): (usize, usize),
                      (end_x, end_y): (usize, usize))
                      -> Vec<String> {
+        self.modified = true;
         if start_y == end_y {
             vec![self.lines[start_y].drain(start_x..end_x).collect()]
         } else {
@@ -350,6 +351,8 @@ impl Buffer {
 
     fn paste(&mut self, x: usize, y: usize, lines: &[String]) {
         if let Some((last, init)) = lines.split_last() {
+            self.modified = true;
+
             if let Some((first, mids)) = init.split_first() {
                 let rest_of_line = self.lines[y].split_off(x);
                 let last_insert_line = last.to_string() + &rest_of_line;
