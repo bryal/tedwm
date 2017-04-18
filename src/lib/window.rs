@@ -251,6 +251,20 @@ impl Window {
         self.move_point_to_line(line_i)
     }
 
+    pub fn move_point_to_end_of_line(&mut self) {
+        let buffer = self.buffer.borrow();
+        let line_len = buffer.lines()[self.point.line_i].len();
+        self.point.col_byte_i = line_len;
+        self.point.update_col_i(&buffer);
+        self.point.prev_col_i = self.point.col_i;
+    }
+
+    pub fn move_point_to_beginning_of_line(&mut self) {
+        self.point.col_byte_i = 0;
+        self.point.update_col_i(&self.buffer.borrow());
+        self.point.prev_col_i = self.point.col_i;
+    }
+
     /// Move point upward or downward by near full window height
     fn page_v(&mut self, up: bool) -> MoveRes {
         let n = (self.h as f32 * 0.8).ceil() as isize;
@@ -271,15 +285,6 @@ impl Window {
         self.page_v(false)
     }
 
-    /// Move point to the end of the line
-    pub fn move_point_to_end_of_line(&mut self) {
-        let buffer = self.buffer.borrow();
-        let line = &buffer.lines()[self.point.line_i];
-        self.point.col_byte_i = line.len();
-        self.point.update_col_i(&buffer)
-    }
-
-    /// Move point to the end of the buffer
     pub fn move_point_to_end_of_buffer(&mut self) {
         {
             let buffer = self.buffer.borrow();
@@ -287,6 +292,11 @@ impl Window {
             self.point.line_i = n_lines - 1;
         }
         self.move_point_to_end_of_line()
+    }
+
+    pub fn move_point_to_beginning_of_buffer(&mut self) {
+        self.point.line_i = 0;
+        self.move_point_to_beginning_of_line()
     }
 
     /// Returns whether the search succeded

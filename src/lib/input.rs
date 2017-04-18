@@ -63,10 +63,18 @@ pub enum Cmd {
     MoveH(isize),
     /// Move point n characters vertically
     MoveV(isize),
+    /// Move point to end of line
+    EndOfLine,
+    /// Move point to beginning of line
+    BeginningOfLine,
     /// Move point upward by near window height
     PageUp,
     /// Move point downward by near window height
     PageDown,
+    /// Move point to end of the buffer
+    EndOfBuffer,
+    /// Move point to beginning of buffer
+    BeginningOfBuffer,
     /// Do incremental search forward
     SearchForward,
     /// Do incremental search backward

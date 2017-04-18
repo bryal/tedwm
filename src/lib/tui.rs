@@ -73,8 +73,12 @@ impl Tui {
                             (vec![Key::Left], Cmd::MoveH(-1)),
                             (vec![Key::Down], Cmd::MoveV(1)),
                             (vec![Key::Up], Cmd::MoveV(-1)),
+                            (vec![Key::Ctrl('e')], Cmd::EndOfLine),
+                            (vec![Key::Ctrl('a')], Cmd::BeginningOfLine),
                             (vec![Key::Alt('p')], Cmd::PageUp),
                             (vec![Key::Alt('n')], Cmd::PageDown),
+                            (vec![Key::Alt('>')], Cmd::EndOfBuffer),
+                            (vec![Key::Alt('<')], Cmd::BeginningOfBuffer),
                             (vec![Key::Ctrl('s')], Cmd::SearchForward),
                             (vec![Key::Ctrl('r')], Cmd::SearchBackward),
                             (vec![Key::Ctrl('d')], Cmd::DeleteCharsH(1)),
@@ -181,28 +185,36 @@ impl Tui {
 
     fn search_forward_open_prompt(&mut self, default: &str) {
         match self.frame.active_window.clone() {
-            ActiveWindow::Window(_) => self.prompt("Search: ", default, move |ted, query| {
-                if ted.active_window().borrow_mut().search_forward(query) {
-                    ted.active_window().borrow_mut().reposition_view();
-                    ted.search_forward_open_prompt(query)                   
-                } else {
-                    ted.message("Search failed")
-                }
-            }),
+            ActiveWindow::Window(_) => {
+                self.prompt("Search: ",
+                            default,
+                            move |ted, query| if ted.active_window()
+                                                         .borrow_mut()
+                                                         .search_forward(query) {
+                                ted.active_window().borrow_mut().reposition_view();
+                                ted.search_forward_open_prompt(query)
+                            } else {
+                                ted.message("Search failed")
+                            })
+            }
             ActiveWindow::Prompt(_) => self.message("Can't search in minibuffer"),
         }
     }
 
     fn search_backward_open_prompt(&mut self, default: &str) {
         match self.frame.active_window.clone() {
-            ActiveWindow::Window(_) => self.prompt("Search backward: ", default, move |ted, query| {
-                if ted.active_window().borrow_mut().search_backward(query) {
-                    ted.active_window().borrow_mut().reposition_view();
-                    ted.search_backward_open_prompt(query)                   
-                } else {
-                    ted.message("Search failed")
-                }
-            }),
+            ActiveWindow::Window(_) => {
+                self.prompt("Search backward: ",
+                            default,
+                            move |ted, query| if ted.active_window()
+                                                         .borrow_mut()
+                                                         .search_backward(query) {
+                                ted.active_window().borrow_mut().reposition_view();
+                                ted.search_backward_open_prompt(query)
+                            } else {
+                                ted.message("Search failed")
+                            })
+            }
             ActiveWindow::Prompt(_) => self.message("Can't search in minibuffer"),
         }
     }
@@ -302,7 +314,8 @@ impl Tui {
     }
 
     fn switch_buffer(&mut self) {
-        self.prompt("Switch to buffer: ", "",
+        self.prompt("Switch to buffer: ",
+                    "",
                     |ted, s| ted.switch_to_buffer_with_name(s))
     }
 
@@ -398,7 +411,7 @@ impl Tui {
     }
 
     /// Prompt the user for input, then pass the parsed input to the given callback
-    fn prompt<F>(&mut self, prompt: &str, default: &str,  callback: F)
+    fn prompt<F>(&mut self, prompt: &str, default: &str, callback: F)
         where F: FnOnce(&mut Tui, &str) + 'static
     {
         let prompt_w = self.frame.minibuffer.push_new_prompt(self.frame.active_window.clone(),
@@ -455,8 +468,16 @@ impl Tui {
             Cmd::Insert(c) => self.insert_char_at_point(c),
             Cmd::MoveH(n) => r = self.move_point_h(n),
             Cmd::MoveV(n) => r = self.move_point_v(n),
+            Cmd::EndOfLine => self.active_window().borrow_mut().move_point_to_end_of_line(),
+            Cmd::BeginningOfLine => self.active_window()
+                                        .borrow_mut()
+                                        .move_point_to_beginning_of_line(),
             Cmd::PageUp => r = self.page_up(),
             Cmd::PageDown => r = self.page_down(),
+            Cmd::EndOfBuffer => self.active_window().borrow_mut().move_point_to_end_of_buffer(),
+            Cmd::BeginningOfBuffer => self.active_window()
+                                          .borrow_mut()
+                                          .move_point_to_beginning_of_buffer(),
             Cmd::SearchForward => self.search_forward_open_prompt(""),
             Cmd::SearchBackward => self.search_backward_open_prompt(""),
             Cmd::DeleteCharsH(n) => r = self.delete_chars_h(n),
