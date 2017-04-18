@@ -13,13 +13,13 @@ pub fn key_seq_to_string(ks: &[Key]) -> String {
         [] => panic!("Key seqyence empty"),
         [Key::Char('\t'), ref rest..] => ("<tab>".to_string(), rest),
         [Key::Char('\n'), ref rest..] => ("<return>".to_string(), rest),
-        [Key::Char(c @ '\u{1}'...'\u{1F}'), ref rest..] => {
-            (format!("C-{}", (c as u8 - 1 + 'a' as u8) as char), rest)
+        [Key::Char(c @ '\u{0}'...'\u{1F}'), ref rest..] => {
+            (format!("C-{}", (c as u8 + '@' as u8) as char), rest)
         }
         [Key::Char(c), ref rest..] => (format!("{}", c), rest),
         [Key::Ctrl(c), ref rest..] => (format!("C-{}", c), rest),
-        [Key::Alt(c @ '\u{1}'...'\u{1F}'), ref rest..] => {
-            (format!("C-M-{}", (c as u8 - 1 + 'a' as u8) as char), rest)
+        [Key::Alt(c @ '\u{0}'...'\u{1F}'), ref rest..] => {
+            (format!("C-M-{}", (c as u8 + '@' as u8) as char), rest)
         }
         [Key::Alt(c), ref rest..] => (format!("M-{}", c), rest),
         [Key::F(n), ref rest..] => (format!("<f{}>", n), rest),
@@ -90,6 +90,8 @@ pub enum Cmd {
     /// Cycles the active entry to paste of the clipboard forward (newer, positive)
     /// or backward (older, negative).
     CycleClipring(isize),
+    /// Unto the latest change
+    Undo,
     /// Insert a newline
     Newline,
     /// Read a number from prompt and go to that line
@@ -122,8 +124,8 @@ pub type Keymap = ::sequence_trie::SequenceTrie<Key, Cmd>;
 pub fn bind_key(keymap: &mut Keymap, key_seq: &[Key], cmd: Cmd) -> Option<Cmd> {
     let key_seq_remapped = key_seq.iter()
                                   .flat_map(|key| match *key {
-                                      Key::Alt(c @ '\u{1}'...'\u{1F}') => {
-                                          vec![Key::Esc, Key::Ctrl((c as u8 | 0b11 << 6) as char)]
+                                      Key::Alt(c @ '\u{0}'...'\u{1F}') => {
+                                          vec![Key::Esc, Key::Ctrl((c as u8 + '@' as u8) as char)]
                                       }
                                       Key::Alt(c) => vec![Key::Esc, Key::Char(c)],
                                       _ => vec![key.clone()],

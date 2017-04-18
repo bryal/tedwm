@@ -1,69 +1,12 @@
 use lib::*;
-use lib::buffer::Buffer;
+use lib::buffer::{Buffer, Point};
 use lib::frame::Partition;
 use std::cell::RefCell;
-use std::cmp::{min, max, Ordering};
+use std::cmp::{min, max};
 use std::iter::{once, repeat};
 use std::rc::{Weak, Rc};
 use std::str;
 use unicode_segmentation::UnicodeSegmentation;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Point {
-    /// 0-based index of, hopefully, column in terminal
-    ///
-    /// E.g. a grapheme that consists of 8 bytes, but should be rendered as
-    /// a half-width glyph / single monospace, will count as 1 column.
-    /// Because of the nature of fonts and the unicode standard, this might
-    /// not always be the case, which means that this value might be incorrect.
-    /// This should, however, only affect the rendered appearance of the cursor
-    /// in relation to the text, and it should not happen often.
-    pub col_i: usize,
-    /// The byte-index corresponding to `self.col` in the current line string
-    pub col_byte_i: usize,
-    /// Column index before moving vertically.
-    ///
-    /// Used to keep track of column when moving along lines
-    /// that might be shorter than current line
-    pub prev_col_i: usize,
-    /// 0-based index of line in memory
-    pub line_i: usize,
-}
-
-impl Point {
-    fn new() -> Point {
-        Point {
-            col_i: 0,
-            col_byte_i: 0,
-            prev_col_i: 0,
-            line_i: 0,
-        }
-    }
-
-    /// Update the column-position of the point in buffer `buffer`
-    fn update_col_i(&mut self, buffer: &Buffer) {
-        self.col_i = display_width(&buffer.lines()[self.line_i][0..self.col_byte_i]);
-    }
-}
-
-impl Ord for Point {
-    fn cmp(&self, other: &Self) -> Ordering {
-        if self.line_i > other.line_i ||
-           ((self.line_i == other.line_i) && self.col_i > other.col_i) {
-            Ordering::Greater
-        } else if (self.line_i == other.line_i) && (self.col_i > other.col_i) {
-            Ordering::Equal
-        } else {
-            Ordering::Less
-        }
-    }
-}
-
-impl PartialOrd for Point {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
 
 /// Describes whether a move was prevented by the point being at the
 /// beginning or end of buffer
@@ -159,7 +102,9 @@ impl Window {
     ///
     /// Returns whether move was prevented by beginning/end of buffer
     pub fn move_point_h(&mut self, n_with_dir: isize) -> MoveRes {
-        let buffer = self.buffer.borrow();
+        let mut buffer = self.buffer.borrow_mut();
+
+        buffer.changes.break_undo_sequence();
 
         let forward = n_with_dir >= 0;
         let mut n = n_with_dir.abs() as usize;
@@ -213,7 +158,10 @@ impl Window {
 
     /// Move point to an absolute line number
     pub fn move_point_to_line(&mut self, line_i: isize) -> MoveRes {
-        let buffer = self.buffer.borrow();
+        let mut buffer = self.buffer.borrow_mut();
+
+        buffer.changes.break_undo_sequence();
+
         let n_lines = buffer.lines().len();
 
         let move_res = if line_i >= n_lines as isize {
@@ -252,7 +200,10 @@ impl Window {
     }
 
     pub fn move_point_to_end_of_line(&mut self) {
-        let buffer = self.buffer.borrow();
+        let mut buffer = self.buffer.borrow_mut();
+
+        buffer.changes.break_undo_sequence();
+
         let line_len = buffer.lines()[self.point.line_i].len();
         self.point.col_byte_i = line_len;
         self.point.update_col_i(&buffer);
@@ -260,6 +211,7 @@ impl Window {
     }
 
     pub fn move_point_to_beginning_of_line(&mut self) {
+        self.buffer.borrow_mut().changes.break_undo_sequence();
         self.point.col_byte_i = 0;
         self.point.update_col_i(&self.buffer.borrow());
         self.point.prev_col_i = self.point.col_i;
@@ -287,7 +239,10 @@ impl Window {
 
     pub fn move_point_to_end_of_buffer(&mut self) {
         {
-            let buffer = self.buffer.borrow();
+            let mut buffer = self.buffer.borrow_mut();
+
+            buffer.changes.break_undo_sequence();
+
             let n_lines = buffer.lines().len();
             self.point.line_i = n_lines - 1;
         }
@@ -302,7 +257,10 @@ impl Window {
     /// Returns whether the search succeded
     pub fn search_forward(&mut self, query: &str) -> bool {
         let buffer = self.buffer.clone();
-        let buffer_b = buffer.borrow();
+        let mut buffer_b = buffer.borrow_mut();
+
+        buffer_b.changes.break_undo_sequence();
+
         let lines = buffer_b.lines();
 
         let search_line_is = once((self.point.col_byte_i, self.point.line_i))
@@ -328,7 +286,10 @@ impl Window {
     /// Returns whether the search succeded
     pub fn search_backward(&mut self, query: &str) -> bool {
         let buffer = self.buffer.clone();
-        let buffer_b = buffer.borrow();
+        let mut buffer_b = buffer.borrow_mut();
+
+        buffer_b.changes.break_undo_sequence();
+
         let lines = buffer_b.lines();
 
         let same_line = if self.point.col_byte_i > 0 {
@@ -422,7 +383,7 @@ impl Window {
     pub fn paste(&mut self, lines: &[String]) {
         let mut buffer = self.buffer.borrow_mut();
 
-        buffer.paste(self.point.col_byte_i, self.point.line_i, lines);
+        buffer.paste((self.point.col_byte_i, self.point.line_i), lines);
 
         let last = lines.last().expect("No lines to paste");
         self.point.line_i += lines.len() - 1;
@@ -445,6 +406,21 @@ impl Window {
         move_res
     }
 
+    /// Returns whether there was anything to undo
+    pub fn undo(&mut self) -> bool {
+        let mut buffer = self.buffer.borrow_mut();
+        match buffer.undo() {
+            Some((x, y)) => {
+                self.point.line_i = y;
+                self.point.col_byte_i = x;
+                self.point.update_col_i(&buffer);
+                self.point.prev_col_i = self.point.col_i;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn switch_to_buffer(&mut self, buffer: Rc<RefCell<Buffer>>) {
         self.buffer = buffer;
         self.mark = None;
@@ -453,6 +429,7 @@ impl Window {
 
     pub fn cancel(&mut self) {
         self.mark = None;
+        self.buffer.borrow_mut().changes.break_undo_sequence()
     }
 
     /// Position the view of the window such that the pointer is in view.
@@ -585,20 +562,20 @@ impl Window {
             let (s_i, e_i) = (byte_index_of_col(s_x, &rendering_lines[s_y]),
                               byte_index_of_col(e_x, &rendering_lines[e_y]));
 
-            let bg_select_s = COLOR_BG_SELECTION.to_string();
-            let bg_select_len = bg_select_s.len();
-            let bg = COLOR_BG.to_string();
+            let select_color_s = format!("{}{}", *COLOR_BG_SELECTION, *COLOR_TEXT_SELECTION);
+            let select_color_len = select_color_s.len();
+            let normal_color_s = format!("{}{}", *COLOR_BG, *COLOR_TEXT);
 
-            rendering_lines[s_y].insert_str(s_i, &bg_select_s);
+            rendering_lines[s_y].insert_str(s_i, &select_color_s);
 
             for y in s_y..e_y {
                 let line_len = rendering_lines[y].len();
-                rendering_lines[y].insert_str(line_len, &bg);
+                rendering_lines[y].insert_str(line_len, &normal_color_s);
 
-                rendering_lines[y + 1].insert_str(0, &bg_select_s);
+                rendering_lines[y + 1].insert_str(0, &select_color_s);
             }
 
-            rendering_lines[e_y].insert_str(e_i + bg_select_len, &bg);
+            rendering_lines[e_y].insert_str(e_i + select_color_len, &normal_color_s);
         }
     }
 

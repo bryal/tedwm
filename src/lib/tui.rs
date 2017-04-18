@@ -90,6 +90,9 @@ impl Tui {
                             (vec![Key::Ctrl('y')], Cmd::Paste),
                             (vec![Key::Alt('y')], Cmd::CycleClipring(-1)),
                             (vec![Key::Alt('Y')], Cmd::CycleClipring(1)),
+                            (vec![Key::Ctrl('/')], Cmd::Undo),
+                            (vec![Key::Ctrl('_')], Cmd::Undo),
+                            (vec![Key::Ctrl('7')], Cmd::Undo),
                             (vec![Key::Char('\n')], Cmd::Newline),
                             (vec![Key::Char('\t')], Cmd::Tab),
                             (vec![Key::Ctrl('x'), Key::Ctrl('s')], Cmd::Save),
@@ -264,6 +267,14 @@ impl Tui {
                                                     .collect::<String>()))
         } else {
             self.message("Clipring is empty")
+        }
+    }
+
+    fn undo(&mut self) {
+        if self.active_window().borrow_mut().undo() {
+            self.message("Undo")
+        } else {
+            self.message("Nothing to undo")
         }
     }
 
@@ -485,6 +496,7 @@ impl Tui {
             Cmd::Cut => self.cut_selection(),
             Cmd::Paste => self.paste(),
             Cmd::CycleClipring(n) => self.cycle_clipring(n),
+            Cmd::Undo => self.undo(),
             Cmd::Newline => self.insert_new_line(),
             Cmd::Tab => self.insert_tab(),
             Cmd::Exit => self.try_exit(HashSet::new()),
@@ -518,9 +530,9 @@ impl Tui {
     }
 
     /// Write a message to the *message* buffer
-    fn message<S: Into<String>>(&mut self, msg: S) {
-        let msg = msg.into();
-        self.frame.minibuffer.echo(&msg);
+    fn message<S: AsRef<str>>(&mut self, msg: S) {
+        let msg = msg.as_ref();
+        self.frame.minibuffer.echo(msg);
         self.message_buffer_mut().push_line(msg);
     }
 

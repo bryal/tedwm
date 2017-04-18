@@ -10,13 +10,14 @@ use std::cmp::max;
 use unicode_segmentation::UnicodeSegmentation;
 
 lazy_static! {
-    pub static ref COLOR_BG: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x18, 0x18, 0x10));
+    pub static ref COLOR_BG: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x10, 0x20, 0x26));
     pub static ref COLOR_TEXT: color::Fg<color::Rgb> = color::Fg(color::Rgb(0xF0, 0xE6, 0xD6));
-    pub static ref COLOR_BG_SELECTION: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x80, 0x00, 0x38));
+    pub static ref COLOR_BG_SELECTION: color::Bg<color::Rgb> = color::Bg(color::Rgb(0xFF, 0x10, 0x50));
+    pub static ref COLOR_TEXT_SELECTION: color::Fg<color::Rgb> = color::Fg(color::Rgb(0x00, 0x10, 0x10));
     pub static ref COLOR_DIM_TEXT: color::Fg<color::Rgb> = color::Fg(color::Rgb(0x60, 0x56, 0x50));
-    pub static ref COLOR_BG_MODELINE: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x4B, 0x4B, 0x40));
+    pub static ref COLOR_BG_MODELINE: color::Bg<color::Rgb> = color::Bg(color::Rgb(0x54, 0x3A, 0x4A));
     pub static ref COLOR_BG_MODELINE_INACTIVE: color::Bg<color::Rgb> =
-        color::Bg(color::Rgb(0x29, 0x29, 0x22));
+        color::Bg(color::Rgb(0x20, 0x34, 0x30));
 }
 
 /// Vertical scroll margin as a normalized percentage of window height
