@@ -499,7 +499,7 @@ impl Tui {
             Cmd::Undo => self.undo(),
             Cmd::Newline => self.insert_new_line(),
             Cmd::Tab => self.insert_tab(),
-            Cmd::Exit => self.try_exit(HashSet::new()),
+            Cmd::Exit => self.try_exit(),
             Cmd::GoToLine => self.go_to_line(),
             Cmd::Save => self.save_active_buffer(),
             Cmd::OpenFile => self.open_file(),
@@ -720,11 +720,11 @@ impl Tui {
                     match decisions.contains_str(inp) {
                         seq_set::StringEntry::Some(ref s) if s == "yes" => {
                             ted.save_buffer(buffer);
-                            ted.try_exit(ignore_buffers)
+                            ted._try_exit(ignore_buffers)
                         }
                         seq_set::StringEntry::Some(ref s) if s == "ignore" => {
                             ignore_buffers.insert(name);
-                            ted.try_exit(ignore_buffers)
+                            ted._try_exit(ignore_buffers)
                         }
                         seq_set::StringEntry::Some(ref s) if s == "cancel" => (),
                         seq_set::StringEntry::Some(_) => unreachable!(),
@@ -734,11 +734,11 @@ impl Tui {
                                                        .map(String::as_str)
                                                        .intersperse(", ")
                                                        .collect::<String>()));
-                            ted.try_exit(HashSet::new())
+                            ted._try_exit(ignore_buffers)
                         }
                         seq_set::StringEntry::None => {
                             ted.message(format!("Undefined option \"{}\"", inp));
-                            ted.try_exit(HashSet::new())
+                            ted._try_exit(ignore_buffers)
                         }
                     }
                 });
@@ -749,11 +749,20 @@ impl Tui {
         true
     }
 
-    fn try_exit(&mut self, ignore_buffers: HashSet<String>) {
+    fn _try_exit(&mut self, ignore_buffers: HashSet<String>) {
         if self.cleanup(ignore_buffers) {
             write!(self.term, "{}", ::termion::clear::All).ok();
             process::exit(0)
         }
+    }
+
+    fn try_exit(&mut self) {
+        let temp_buffer_names = self.buffers
+                                    .keys()
+                                    .filter(|name| name.starts_with('*') && name.ends_with('*'))
+                                    .cloned()
+                                    .collect();
+        self._try_exit(temp_buffer_names)
     }
 }
 
